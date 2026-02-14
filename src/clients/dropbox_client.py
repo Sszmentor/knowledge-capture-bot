@@ -35,15 +35,16 @@ class DropboxClient:
         )
         self.allowed_root = allowed_root.rstrip("/").lower()
 
-        # Force token refresh on init — without this,
-        # first API call fails with invalid_access_token
+        # Verify connection with a simple files operation
+        # (not users_get_current_account — requires account_info.read scope)
         try:
             self.dbx.check_and_refresh_access_token()
-            account = self.dbx.users_get_current_account()
-            logger.info(
-                f"Dropbox connected as {account.name.display_name} "
-                f"(writes restricted to: {self.allowed_root})"
-            )
+            # Try listing root — uses files.metadata.read scope
+            self.dbx.files_list_folder("", limit=1)
+            logger.info(f"Dropbox connected (writes restricted to: {self.allowed_root})")
+        except dropbox.exceptions.ApiError:
+            # List folder may fail on root, but token was refreshed
+            logger.info(f"Dropbox token refreshed (writes restricted to: {self.allowed_root})")
         except Exception as e:
             logger.error(f"Dropbox auth failed: {e}")
             raise
