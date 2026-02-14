@@ -19,6 +19,10 @@ from src.writers.obsidian_writer import ObsidianWriter
 
 logger = logging.getLogger(__name__)
 
+# Immediate print — see if module loads at all
+import sys
+print("=== Knowledge Capture Bot module loaded ===", flush=True, file=sys.stderr)
+
 # Global references for periodic tasks
 _telegram_task: Optional[asyncio.Task] = None
 _telegram_source: Optional[TelegramSource] = None
