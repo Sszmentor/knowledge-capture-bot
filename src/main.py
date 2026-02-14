@@ -13,19 +13,24 @@ from fastapi import FastAPI
 
 from src.clients.dropbox_client import DropboxClient
 from src.config import Settings, get_settings
+from src.sources.lms_source import LmsSource
 from src.sources.telegram_source import TelegramSource
 from src.state import SyncState
+from src.writers.lms_formatter import format_lms_session, get_session_filename
 from src.writers.obsidian_writer import ObsidianWriter
 
 logger = logging.getLogger(__name__)
 
 # Global references for periodic tasks
 _telegram_task: Optional[asyncio.Task] = None
+_lms_task: Optional[asyncio.Task] = None
 _telegram_source: Optional[TelegramSource] = None
+_lms_source: Optional[LmsSource] = None
 _state: Optional[SyncState] = None
 _writer: Optional[ObsidianWriter] = None
 _settings: Optional[Settings] = None
 _last_sync: Optional[dict] = None
+_last_lms_sync: Optional[dict] = None
 
 
 def _setup_logging(level: str) -> None:
@@ -131,6 +136,96 @@ async def sync_telegram() -> dict:
     return _last_sync
 
 
+async def sync_lms() -> dict:
+    """Run LMS sync — fetch bundle, parse sessions, write to Obsidian.
+
+    Uses content hashing to detect changes per session.
+    Returns dict with sync results.
+    """
+    global _last_lms_sync
+
+    state = _state
+    settings = _settings
+
+    if not all([_lms_source, state, _writer]):
+        return {"error": "Not initialized"}
+
+    dbx = _writer.dbx
+    lms_folder = settings.obsidian_lms_folder
+    vault_path = settings.dropbox_vault_path
+
+    try:
+        sessions = await _lms_source.get_sessions()
+    except Exception as e:
+        logger.exception(f"Failed to fetch LMS sessions: {e}")
+        return {"error": str(e)}
+
+    updated = 0
+    skipped = 0
+    errors = 0
+    details = {}
+
+    for session in sessions:
+        source_key = f"lms:{session.id}"
+        try:
+            # Check if content changed
+            old_hash = state.get_content_hash(source_key)
+            new_hash = session.content_hash
+
+            if old_hash == new_hash:
+                skipped += 1
+                continue
+
+            # Generate markdown
+            markdown = format_lms_session(session)
+            filename = get_session_filename(session)
+
+            # Write to Dropbox
+            dropbox_path = f"{vault_path}/{lms_folder}/{filename}.md"
+            relative_path = f"{lms_folder}/{filename}.md"
+
+            result = dbx.upload_file(markdown, dropbox_path, overwrite=True)
+
+            if result:
+                state.update_lms(
+                    source_key=source_key,
+                    content_hash=new_hash,
+                    obsidian_path=relative_path,
+                )
+                updated += 1
+                details[session.id] = {
+                    "title": session.title,
+                    "status": "updated",
+                    "path": relative_path,
+                }
+                logger.info(f"LMS: updated {session.id} → {filename}")
+            else:
+                errors += 1
+                details[session.id] = {"error": "upload failed"}
+                logger.error(f"LMS: failed to upload {session.id}")
+
+        except Exception as e:
+            errors += 1
+            details[session.id] = {"error": str(e)}
+            logger.exception(f"LMS: error processing {session.id}: {e}")
+
+    _last_lms_sync = {
+        "timestamp": datetime.now().isoformat(),
+        "total_sessions": len(sessions),
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+        "details": details,
+    }
+
+    logger.info(
+        f"LMS sync complete: {updated} updated, "
+        f"{skipped} unchanged, {errors} errors "
+        f"(out of {len(sessions)} sessions)"
+    )
+    return _last_lms_sync
+
+
 async def _periodic_telegram_sync(interval_seconds: int) -> None:
     """Periodic Telegram sync task."""
     # First sync: 30 seconds after startup (let Telethon connect)
@@ -146,10 +241,27 @@ async def _periodic_telegram_sync(interval_seconds: int) -> None:
         await asyncio.sleep(interval_seconds)
 
 
+async def _periodic_lms_sync(interval_seconds: int) -> None:
+    """Periodic LMS sync task."""
+    # First sync: 60 seconds after startup
+    await asyncio.sleep(60)
+
+    while True:
+        try:
+            logger.info("Periodic sync: starting LMS check...")
+            await sync_lms()
+        except Exception as e:
+            logger.exception(f"Error in periodic LMS sync: {e}")
+
+        await asyncio.sleep(interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize clients on startup, cleanup on shutdown."""
-    global _telegram_task, _telegram_source, _state, _writer, _settings
+    global _telegram_task, _lms_task
+    global _telegram_source, _lms_source
+    global _state, _writer, _settings
 
     settings = get_settings()
     _settings = settings
@@ -207,7 +319,10 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to connect to Telegram: {e}")
         _telegram_source = None
 
-    # Start periodic tasks only if both Telegram and Dropbox are ready
+    # Initialize LMS source
+    _lms_source = LmsSource(base_url=settings.lms_base_url)
+
+    # Start periodic tasks only if Dropbox is ready
     if _telegram_source and dbx:
         interval = settings.telegram_poll_interval
         logger.info(
@@ -217,10 +332,20 @@ async def lifespan(app: FastAPI):
         _telegram_task = asyncio.create_task(_periodic_telegram_sync(interval))
     else:
         logger.warning(
-            "Periodic sync NOT started — "
+            "Periodic Telegram sync NOT started — "
             f"Telegram={'OK' if _telegram_source else 'FAIL'}, "
             f"Dropbox={'OK' if dbx else 'FAIL'}"
         )
+
+    if dbx:
+        lms_interval = settings.lms_poll_interval
+        logger.info(
+            f"Starting periodic LMS sync (every {lms_interval // 3600}h "
+            f"{(lms_interval % 3600) // 60}m)"
+        )
+        _lms_task = asyncio.create_task(_periodic_lms_sync(lms_interval))
+    else:
+        logger.warning("Periodic LMS sync NOT started — Dropbox not available")
 
     logger.info("=== Knowledge Capture Bot ready ===")
 
@@ -229,12 +354,13 @@ async def lifespan(app: FastAPI):
     # Cleanup
     logger.info("=== Shutting down ===")
 
-    if _telegram_task:
-        _telegram_task.cancel()
-        try:
-            await _telegram_task
-        except asyncio.CancelledError:
-            pass
+    for task in [_telegram_task, _lms_task]:
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     if _telegram_source:
         await _telegram_source.disconnect()
@@ -245,7 +371,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Capture Bot",
     description="Автоматический сбор материалов из Telegram и LMS в Obsidian",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -257,22 +383,37 @@ async def health():
         "status": "ok",
         "telegram_connected": _telegram_source is not None,
         "dropbox_connected": _state is not None,
+        "lms_available": _lms_source is not None,
         "uptime": datetime.now().isoformat(),
     }
 
 
 @app.post("/sync")
 async def manual_sync():
-    """Manual sync trigger — all sources."""
-    result = await sync_telegram()
-    return result
+    """Manual sync trigger — all sources (Telegram + LMS)."""
+    tg_result = await sync_telegram()
+    lms_result = await sync_lms()
+    return {"telegram": tg_result, "lms": lms_result}
+
+
+@app.post("/sync/telegram")
+async def manual_sync_telegram():
+    """Manual sync trigger — Telegram only."""
+    return await sync_telegram()
+
+
+@app.post("/sync/lms")
+async def manual_sync_lms():
+    """Manual sync trigger — LMS only."""
+    return await sync_lms()
 
 
 @app.get("/status")
 async def status():
     """Current sync status."""
     return {
-        "last_sync": _last_sync,
+        "last_telegram_sync": _last_sync,
+        "last_lms_sync": _last_lms_sync,
         "state": _state.get_all() if _state else {},
         "sources_configured": len(_settings.get_tg_sources()) if _settings else 0,
     }
