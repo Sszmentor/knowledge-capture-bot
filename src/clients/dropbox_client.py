@@ -34,7 +34,19 @@ class DropboxClient:
             oauth2_refresh_token=refresh_token,
         )
         self.allowed_root = allowed_root.rstrip("/").lower()
-        logger.info(f"Dropbox client initialized (writes restricted to: {self.allowed_root})")
+
+        # Force token refresh on init — without this,
+        # first API call fails with invalid_access_token
+        try:
+            self.dbx.check_and_refresh_access_token()
+            account = self.dbx.users_get_current_account()
+            logger.info(
+                f"Dropbox connected as {account.name.display_name} "
+                f"(writes restricted to: {self.allowed_root})"
+            )
+        except Exception as e:
+            logger.error(f"Dropbox auth failed: {e}")
+            raise
 
     def _validate_path(self, path: str) -> None:
         normalized = path.lower().rstrip("/")
