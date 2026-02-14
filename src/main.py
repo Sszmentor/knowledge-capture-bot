@@ -169,25 +169,30 @@ async def lifespan(app: FastAPI):
     logger.info("=== Knowledge Capture Bot starting ===")
 
     # Initialize Dropbox
-    dbx = DropboxClient(
-        app_key=settings.dropbox_app_key,
-        app_secret=settings.dropbox_app_secret,
-        refresh_token=settings.dropbox_refresh_token,
-    )
+    dbx = None
+    try:
+        dbx = DropboxClient(
+            app_key=settings.dropbox_app_key,
+            app_secret=settings.dropbox_app_secret,
+            refresh_token=settings.dropbox_refresh_token,
+        )
+    except Exception as e:
+        logger.error(f"Dropbox init failed: {e}. Sync will not work.")
 
-    # Initialize state
-    _state = SyncState(
-        dropbox_client=dbx,
-        vault_path=settings.dropbox_vault_path,
-        state_file=settings.state_file_path,
-    )
+    if dbx:
+        # Initialize state
+        _state = SyncState(
+            dropbox_client=dbx,
+            vault_path=settings.dropbox_vault_path,
+            state_file=settings.state_file_path,
+        )
 
-    # Initialize writer
-    _writer = ObsidianWriter(
-        dropbox_client=dbx,
-        vault_path=settings.dropbox_vault_path,
-        chats_folder=settings.obsidian_chats_folder,
-    )
+        # Initialize writer
+        _writer = ObsidianWriter(
+            dropbox_client=dbx,
+            vault_path=settings.dropbox_vault_path,
+            chats_folder=settings.obsidian_chats_folder,
+        )
 
     # Initialize Telegram
     _telegram_source = TelegramSource(
@@ -200,16 +205,22 @@ async def lifespan(app: FastAPI):
         await _telegram_source.connect()
     except Exception as e:
         logger.error(f"Failed to connect to Telegram: {e}")
-        # Continue without Telegram — LMS can still work
         _telegram_source = None
 
-    # Start periodic tasks
-    interval = settings.telegram_poll_interval
-    logger.info(
-        f"Starting periodic Telegram sync (every {interval // 3600}h "
-        f"{(interval % 3600) // 60}m)"
-    )
-    _telegram_task = asyncio.create_task(_periodic_telegram_sync(interval))
+    # Start periodic tasks only if both Telegram and Dropbox are ready
+    if _telegram_source and dbx:
+        interval = settings.telegram_poll_interval
+        logger.info(
+            f"Starting periodic Telegram sync (every {interval // 3600}h "
+            f"{(interval % 3600) // 60}m)"
+        )
+        _telegram_task = asyncio.create_task(_periodic_telegram_sync(interval))
+    else:
+        logger.warning(
+            "Periodic sync NOT started — "
+            f"Telegram={'OK' if _telegram_source else 'FAIL'}, "
+            f"Dropbox={'OK' if dbx else 'FAIL'}"
+        )
 
     logger.info("=== Knowledge Capture Bot ready ===")
 
@@ -245,6 +256,7 @@ async def health():
     return {
         "status": "ok",
         "telegram_connected": _telegram_source is not None,
+        "dropbox_connected": _state is not None,
         "uptime": datetime.now().isoformat(),
     }
 
