@@ -96,6 +96,24 @@ class DropboxClient:
         except dropbox.exceptions.ApiError:
             return False
 
+    def list_folder(self, folder_path: str) -> list:
+        """List files in a Dropbox folder. Returns list of file metadata entries."""
+        try:
+            result = self.dbx.files_list_folder(folder_path)
+            entries = list(result.entries)
+            while result.has_more:
+                result = self.dbx.files_list_folder_continue(result.cursor)
+                entries.extend(result.entries)
+            return entries
+        except dropbox.exceptions.ApiError as e:
+            if e.error.is_path() and e.error.get_path().is_not_found():
+                return []
+            logger.error(f"List folder error: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"List folder error: {e}")
+            return []
+
     def create_folder_if_not_exists(self, folder_path: str) -> bool:
         self._validate_path(folder_path)
         try:

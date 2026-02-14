@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     telegram_poll_interval: int = Field(default=7200)  # 2 hours
     lms_poll_interval: int = Field(default=21600)  # 6 hours
 
+    # Pipeline (topic extraction)
+    anthropic_api_key: str = Field(default="")
+    pipeline_folder: str = Field(
+        default="20 Projects/AI_Agents/Pipeline"
+    )
+    topic_extraction_enabled: bool = Field(default=True)
+    min_messages_for_extraction: int = Field(default=10)
+
     # Logging
     log_level: str = Field(default="INFO")
 

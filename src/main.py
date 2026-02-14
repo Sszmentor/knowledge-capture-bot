@@ -4,6 +4,7 @@ Polls Telegram chats (2h) and LMS (6h), writes new content
 to Obsidian vault via Dropbox API.
 """
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -13,8 +14,9 @@ from fastapi import FastAPI
 
 from src.clients.dropbox_client import DropboxClient
 from src.config import Settings, get_settings
+from src.extractors.topic_extractor import ExtractedTopic, TopicExtractor
 from src.sources.lms_source import LmsSource
-from src.sources.telegram_source import TelegramSource
+from src.sources.telegram_source import TelegramMessage, TelegramSource
 from src.state import SyncState
 from src.writers.lms_formatter import format_lms_session, get_session_filename
 from src.writers.obsidian_writer import ObsidianWriter
@@ -26,6 +28,7 @@ _telegram_task: Optional[asyncio.Task] = None
 _lms_task: Optional[asyncio.Task] = None
 _telegram_source: Optional[TelegramSource] = None
 _lms_source: Optional[LmsSource] = None
+_topic_extractor: Optional[TopicExtractor] = None
 _state: Optional[SyncState] = None
 _writer: Optional[ObsidianWriter] = None
 _settings: Optional[Settings] = None
@@ -68,6 +71,7 @@ async def sync_telegram() -> dict:
 
     results = {}
     total_new = 0
+    all_new_messages: list[TelegramMessage] = []
 
     for source in sources:
         source_key = f"tg:{source.chat_id}"
@@ -112,6 +116,10 @@ async def sync_telegram() -> dict:
                         obsidian_path=obsidian_path,
                     )
 
+            # Collect messages for topic extraction
+            for topic in sync_result.topics:
+                all_new_messages.extend(topic.messages)
+
             results[source.key] = {
                 "chat_name": sync_result.source_name,
                 "new_messages": sync_result.total_new,
@@ -123,15 +131,28 @@ async def sync_telegram() -> dict:
             logger.exception(f"Error syncing {source.key}: {e}")
             results[source.key] = {"error": str(e)}
 
+    # ── Topic Extraction ──────────────────────────────────────────
+    topics_extracted = 0
+    if (
+        _topic_extractor
+        and _settings.topic_extraction_enabled
+        and total_new >= _settings.min_messages_for_extraction
+    ):
+        try:
+            topics_extracted = await _extract_and_save_topics(all_new_messages)
+        except Exception as e:
+            logger.exception(f"Topic extraction failed: {e}")
+
     _last_sync = {
         "timestamp": datetime.now().isoformat(),
         "total_new_messages": total_new,
+        "topics_extracted": topics_extracted,
         "sources": results,
     }
 
     logger.info(
         f"Telegram sync complete: {total_new} new messages "
-        f"from {len(sources)} sources"
+        f"from {len(sources)} sources, {topics_extracted} topics extracted"
     )
     return _last_sync
 
@@ -226,6 +247,83 @@ async def sync_lms() -> dict:
     return _last_lms_sync
 
 
+async def _extract_and_save_topics(
+    messages: list[TelegramMessage],
+) -> int:
+    """Extract topics from messages and save to Dropbox pipeline folder.
+
+    Returns number of topics extracted.
+    """
+    settings = _settings
+    dbx = _writer.dbx
+    vault_path = settings.dropbox_vault_path
+    pipeline_folder = settings.pipeline_folder
+
+    # Load existing topic titles for dedup
+    existing_titles = await _load_existing_topic_titles()
+
+    # Group messages by source chat for better context
+    # (all messages have sender info, use source_chat from sync)
+    topics = await _topic_extractor.extract_topics(
+        messages=messages,
+        source_chat="AI Mindset chats",
+        existing_titles=existing_titles,
+    )
+
+    if not topics:
+        logger.info("No topics extracted from current batch")
+        return 0
+
+    # Save each topic as JSON to Dropbox
+    today = datetime.now().strftime("%Y-%m-%d")
+    saved = 0
+
+    for topic in topics:
+        filename = f"{today}-{topic.id}.json"
+        dropbox_path = f"{vault_path}/{pipeline_folder}/topics/{filename}"
+
+        try:
+            content = topic.to_json()
+            result = dbx.upload_file(content, dropbox_path, overwrite=False)
+            if result:
+                saved += 1
+                logger.info(f"Pipeline: saved topic '{topic.title}' → {filename}")
+        except Exception as e:
+            logger.error(f"Failed to save topic '{topic.title}': {e}")
+
+    return saved
+
+
+async def _load_existing_topic_titles() -> list[str]:
+    """Load titles of already extracted topics from Dropbox."""
+    settings = _settings
+    dbx = _writer.dbx
+    vault_path = settings.dropbox_vault_path
+    pipeline_folder = settings.pipeline_folder
+    topics_path = f"{vault_path}/{pipeline_folder}/topics"
+
+    titles = []
+    try:
+        entries = dbx.list_folder(topics_path)
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                content = dbx.download_text(f"{topics_path}/{entry.name}")
+                if content:
+                    data = json.loads(content)
+                    title = data.get("title", "")
+                    if title:
+                        titles.append(title)
+            except Exception:
+                continue
+    except Exception as e:
+        # Folder might not exist yet — that's fine
+        logger.debug(f"Could not list existing topics: {e}")
+
+    return titles
+
+
 async def _periodic_telegram_sync(interval_seconds: int) -> None:
     """Periodic Telegram sync task."""
     # First sync: 30 seconds after startup (let Telethon connect)
@@ -260,7 +358,7 @@ async def _periodic_lms_sync(interval_seconds: int) -> None:
 async def lifespan(app: FastAPI):
     """Initialize clients on startup, cleanup on shutdown."""
     global _telegram_task, _lms_task
-    global _telegram_source, _lms_source
+    global _telegram_source, _lms_source, _topic_extractor
     global _state, _writer, _settings
 
     settings = get_settings()
@@ -322,6 +420,13 @@ async def lifespan(app: FastAPI):
     # Initialize LMS source
     _lms_source = LmsSource(base_url=settings.lms_base_url)
 
+    # Initialize Topic Extractor (pipeline)
+    if settings.anthropic_api_key and settings.topic_extraction_enabled:
+        _topic_extractor = TopicExtractor(api_key=settings.anthropic_api_key)
+        logger.info("Topic extraction enabled (pipeline)")
+    else:
+        logger.info("Topic extraction disabled (no ANTHROPIC_API_KEY or disabled)")
+
     # Start periodic tasks only if Dropbox is ready
     if _telegram_source and dbx:
         interval = settings.telegram_poll_interval
@@ -371,7 +476,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Capture Bot",
     description="Автоматический сбор материалов из Telegram и LMS в Obsidian",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -384,6 +489,7 @@ async def health():
         "telegram_connected": _telegram_source is not None,
         "dropbox_connected": _state is not None,
         "lms_available": _lms_source is not None,
+        "pipeline_enabled": _topic_extractor is not None,
         "uptime": datetime.now().isoformat(),
     }
 
@@ -408,6 +514,57 @@ async def manual_sync_lms():
     return await sync_lms()
 
 
+@app.get("/topics")
+async def list_topics():
+    """List extracted pipeline topics from Dropbox."""
+    if not _writer or not _settings:
+        return {"error": "Not initialized"}
+
+    dbx = _writer.dbx
+    vault_path = _settings.dropbox_vault_path
+    topics_path = f"{vault_path}/{_settings.pipeline_folder}/topics"
+
+    topics = []
+    try:
+        entries = dbx.list_folder(topics_path)
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                content = dbx.download_text(f"{topics_path}/{entry.name}")
+                if content:
+                    data = json.loads(content)
+                    topics.append(data)
+            except Exception:
+                continue
+    except Exception as e:
+        return {"error": f"Could not list topics: {e}", "topics": []}
+
+    # Sort by created_at descending
+    topics.sort(key=lambda t: t.get("created_at", ""), reverse=True)
+
+    return {
+        "total": len(topics),
+        "topics": topics,
+    }
+
+
+@app.post("/topics/extract")
+async def manual_extract_topics():
+    """Manual topic extraction — re-sync telegram then extract."""
+    if not _topic_extractor:
+        return {"error": "Topic extraction not configured (set ANTHROPIC_API_KEY)"}
+
+    # First sync to get fresh messages
+    sync_result = await sync_telegram()
+    topics_count = sync_result.get("topics_extracted", 0)
+
+    return {
+        "sync": sync_result,
+        "topics_extracted": topics_count,
+    }
+
+
 @app.get("/status")
 async def status():
     """Current sync status."""
@@ -416,4 +573,5 @@ async def status():
         "last_lms_sync": _last_lms_sync,
         "state": _state.get_all() if _state else {},
         "sources_configured": len(_settings.get_tg_sources()) if _settings else 0,
+        "pipeline_enabled": _topic_extractor is not None,
     }
