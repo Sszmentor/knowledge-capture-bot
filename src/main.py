@@ -538,20 +538,26 @@ async def health():
 async def manual_sync():
     """Manual sync trigger — all sources (Telegram + LMS)."""
     tg_result = await sync_telegram()
+    record_tg_sync(tg_result)
     lms_result = await sync_lms()
+    record_lms_sync(lms_result)
     return {"telegram": tg_result, "lms": lms_result}
 
 
 @app.post("/sync/telegram")
 async def manual_sync_telegram():
     """Manual sync trigger — Telegram only."""
-    return await sync_telegram()
+    result = await sync_telegram()
+    record_tg_sync(result)
+    return result
 
 
 @app.post("/sync/lms")
 async def manual_sync_lms():
     """Manual sync trigger — LMS only."""
-    return await sync_lms()
+    result = await sync_lms()
+    record_lms_sync(result)
+    return result
 
 
 @app.get("/topics")

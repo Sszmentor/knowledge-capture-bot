@@ -101,15 +101,15 @@ class DigestNotifier:
         if anthropic_api_key:
             self._anthropic = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
 
-    async def send_digest(self) -> dict:
-        """Build and send digest. Returns result dict."""
+    async def send_digest(self) -> bool:
+        """Build and send digest. Returns True if sent, False if nothing new."""
         tg_data, lms_data, topics = _consume_accumulated()
 
         # Build aggregated summary
         digest_data = self._build_digest_data(tg_data, lms_data, topics)
         if digest_data is None:
             logger.info("Digest: nothing new, skipping")
-            return {"sent": False, "reason": "nothing new"}
+            return False
 
         # Generate Claude insight (optional — degrade gracefully)
         insight = ""
@@ -139,7 +139,11 @@ class DigestNotifier:
             await asyncio.sleep(60)
             sent = await self._send_telegram(text)
 
-        return {"sent": sent, "period": period, "messages": digest_data["total_tg_messages"]}
+        logger.info(
+            f"Digest {period}: sent={sent}, "
+            f"tg_messages={digest_data['total_tg_messages']}"
+        )
+        return sent
 
     def _build_digest_data(
         self,
