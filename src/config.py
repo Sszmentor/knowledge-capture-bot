@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     topic_extraction_enabled: bool = Field(default=True)
     min_messages_for_extraction: int = Field(default=10)
 
+    # Digest notifications (via Tvorets bot)
+    tvorets_bot_token: str = Field(default="")
+    digest_admin_id: int = Field(default=1075126)
+    digest_morning_hour: int = Field(default=9)   # Novosibirsk time
+    digest_evening_hour: int = Field(default=21)   # Novosibirsk time
+    digest_enabled: bool = Field(default=True)
+
     # Logging
     log_level: str = Field(default="INFO")
 

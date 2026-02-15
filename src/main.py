@@ -15,6 +15,13 @@ from fastapi import FastAPI
 from src.clients.dropbox_client import DropboxClient
 from src.config import Settings, get_settings
 from src.extractors.topic_extractor import ExtractedTopic, TopicExtractor
+from src.notifier import (
+    DigestNotifier,
+    periodic_digest,
+    record_lms_sync,
+    record_tg_sync,
+    record_topics,
+)
 from src.sources.lms_source import LmsSource
 from src.sources.telegram_source import TelegramMessage, TelegramSource
 from src.state import SyncState
@@ -26,6 +33,8 @@ logger = logging.getLogger(__name__)
 # Global references for periodic tasks
 _telegram_task: Optional[asyncio.Task] = None
 _lms_task: Optional[asyncio.Task] = None
+_digest_task: Optional[asyncio.Task] = None
+_notifier: Optional[DigestNotifier] = None
 _telegram_source: Optional[TelegramSource] = None
 _lms_source: Optional[LmsSource] = None
 _topic_extractor: Optional[TopicExtractor] = None
@@ -274,6 +283,9 @@ async def _extract_and_save_topics(
         logger.info("No topics extracted from current batch")
         return 0
 
+    # Record topics for digest notifications
+    record_topics([t.to_dict() for t in topics])
+
     # Save each topic as JSON to Dropbox
     today = datetime.now().strftime("%Y-%m-%d")
     saved = 0
@@ -332,7 +344,8 @@ async def _periodic_telegram_sync(interval_seconds: int) -> None:
     while True:
         try:
             logger.info("Periodic sync: starting Telegram check...")
-            await sync_telegram()
+            result = await sync_telegram()
+            record_tg_sync(result)
         except Exception as e:
             logger.exception(f"Error in periodic Telegram sync: {e}")
 
@@ -347,7 +360,8 @@ async def _periodic_lms_sync(interval_seconds: int) -> None:
     while True:
         try:
             logger.info("Periodic sync: starting LMS check...")
-            await sync_lms()
+            result = await sync_lms()
+            record_lms_sync(result)
         except Exception as e:
             logger.exception(f"Error in periodic LMS sync: {e}")
 
@@ -357,7 +371,7 @@ async def _periodic_lms_sync(interval_seconds: int) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize clients on startup, cleanup on shutdown."""
-    global _telegram_task, _lms_task
+    global _telegram_task, _lms_task, _digest_task, _notifier
     global _telegram_source, _lms_source, _topic_extractor
     global _state, _writer, _settings
 
@@ -452,6 +466,31 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Periodic LMS sync NOT started — Dropbox not available")
 
+    # Initialize Digest Notifier
+    if settings.digest_enabled and settings.tvorets_bot_token:
+        _notifier = DigestNotifier(
+            bot_token=settings.tvorets_bot_token,
+            admin_chat_id=settings.digest_admin_id,
+            anthropic_api_key=settings.anthropic_api_key,
+        )
+        _digest_task = asyncio.create_task(
+            periodic_digest(
+                notifier=_notifier,
+                morning_hour=settings.digest_morning_hour,
+                evening_hour=settings.digest_evening_hour,
+            )
+        )
+        logger.info(
+            f"Digest notifications enabled "
+            f"({settings.digest_morning_hour}:00 + "
+            f"{settings.digest_evening_hour}:00 Novosibirsk)"
+        )
+    else:
+        if not settings.tvorets_bot_token:
+            logger.info("Digest notifications disabled (no TVORETS_BOT_TOKEN)")
+        else:
+            logger.info("Digest notifications disabled (DIGEST_ENABLED=false)")
+
     logger.info("=== Knowledge Capture Bot ready ===")
 
     yield  # App runs
@@ -459,7 +498,7 @@ async def lifespan(app: FastAPI):
     # Cleanup
     logger.info("=== Shutting down ===")
 
-    for task in [_telegram_task, _lms_task]:
+    for task in [_telegram_task, _lms_task, _digest_task]:
         if task:
             task.cancel()
             try:
@@ -476,7 +515,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Capture Bot",
     description="Автоматический сбор материалов из Telegram и LMS в Obsidian",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -490,6 +529,7 @@ async def health():
         "dropbox_connected": _state is not None,
         "lms_available": _lms_source is not None,
         "pipeline_enabled": _topic_extractor is not None,
+        "digest_enabled": _notifier is not None,
         "uptime": datetime.now().isoformat(),
     }
 
@@ -563,6 +603,22 @@ async def manual_extract_topics():
         "sync": sync_result,
         "topics_extracted": topics_count,
     }
+
+
+@app.post("/digest")
+async def manual_digest():
+    """Manual digest trigger — for testing."""
+    if not _notifier:
+        return {"sent": False, "reason": "digest not configured (no TVORETS_BOT_TOKEN)"}
+    try:
+        sent = await _notifier.send_digest()
+        if sent:
+            return {"sent": True}
+        else:
+            return {"sent": False, "reason": "nothing new since last digest"}
+    except Exception as e:
+        logger.exception(f"Manual digest failed: {e}")
+        return {"sent": False, "reason": str(e)}
 
 
 @app.get("/status")
