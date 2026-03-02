@@ -21,16 +21,16 @@ logger = logging.getLogger(__name__)
 # Topic name → Obsidian file name mapping
 # For forum topics, maps topic title to a readable file name
 TOPIC_NAME_MAP = {
-    "general": "w26 General",
-    "General": "w26 General",
-    "support": "w26 Support",
-    "Support": "w26 Support",
-    "intro": "w26 Intro",
-    "Intro": "w26 Intro",
-    "materials/org": "w26 Materials-Org",
-    "Materials/Org": "w26 Materials-Org",
-    "Учимся проектировать ПО": "w26 Учимся проектировать ПО",
-    "Корпоративный ИИ для команды": "w26 Корпоративный ИИ для команде",
+    "general": "General",
+    "General": "General",
+    "support": "Support",
+    "Support": "Support",
+    "intro": "Intro",
+    "Intro": "Intro",
+    "materials/org": "Materials-Org",
+    "Materials/Org": "Materials-Org",
+    "Учимся проектировать ПО": "Учимся проектировать ПО",
+    "Корпоративный ИИ для команды": "Корпоративный ИИ для команды",
 }
 
 # Topic descriptions for new file creation
@@ -56,14 +56,15 @@ def make_safe_filename(title: str) -> str:
 class ObsidianWriter:
     """Writes/updates Obsidian markdown files via Dropbox API."""
 
-    def __init__(self, dropbox_client: DropboxClient, vault_path: str, chats_folder: str):
+    def __init__(self, dropbox_client: DropboxClient, vault_path: str, labs_folder: str, lab_name: str):
         self.dbx = dropbox_client
         self.vault_path = vault_path.rstrip("/")
-        self.chats_folder = chats_folder
+        self.labs_folder = labs_folder
+        self.lab_name = lab_name
 
     def _get_dropbox_path(self, filename: str) -> str:
-        """Build full Dropbox path for a chat file."""
-        return f"{self.vault_path}/{self.chats_folder}/{filename}.md"
+        """Build full Dropbox path for a chat file inside its lab."""
+        return f"{self.vault_path}/{self.labs_folder}/{self.lab_name}/Чаты/{filename}.md"
 
     def get_obsidian_filename(
         self, source_key: str, topic_title: str
@@ -100,7 +101,7 @@ class ObsidianWriter:
 
         filename = self.get_obsidian_filename(source_key, topic.topic_title)
         dropbox_path = self._get_dropbox_path(filename)
-        relative_path = f"{self.chats_folder}/{filename}.md"
+        relative_path = f"{self.labs_folder}/{self.lab_name}/Чаты/{filename}.md"
 
         logger.info(
             f"Writing {len(topic.messages)} messages to {filename}"

@@ -33,6 +33,7 @@ from src.writers.lms_formatter import (
     get_kb_article_filename,
     get_session_filename,
     get_sprint_filename,
+    get_sprint_folder_name,
 )
 from src.writers.obsidian_writer import ObsidianWriter
 
@@ -248,9 +249,9 @@ async def sync_lms() -> dict:
 
 
 async def _sync_lms_sessions(dbx, vault_path: str, settings: Settings) -> dict:
-    """Sync LMS sessions to obsidian_lms_folder."""
+    """Sync LMS sessions to Лаборатории/w26 {lab}/."""
     state = _state
-    lms_folder = settings.obsidian_lms_folder
+    lms_folder = f"{settings.obsidian_labs_folder}/{settings.obsidian_lab_name}"
 
     try:
         sessions = await _lms_source.get_sessions()
@@ -317,9 +318,8 @@ async def _sync_lms_sessions(dbx, vault_path: str, settings: Settings) -> dict:
 
 
 async def _sync_lms_sprints(dbx, vault_path: str, settings: Settings) -> dict:
-    """Sync LMS sprints to obsidian_sprints_folder."""
+    """Sync LMS sprints — each into its own subfolder inside Лаборатории."""
     state = _state
-    sprints_folder = settings.obsidian_sprints_folder
 
     try:
         sprints = await _lms_source.get_sprints()
@@ -348,9 +348,11 @@ async def _sync_lms_sprints(dbx, vault_path: str, settings: Settings) -> dict:
                 continue
 
             markdown = format_sprint(sprint)
+            sprint_folder_name = get_sprint_folder_name(sprint)
             filename = get_sprint_filename(sprint)
-            dropbox_path = f"{vault_path}/{sprints_folder}/{filename}.md"
-            relative_path = f"{sprints_folder}/{filename}.md"
+            sprint_folder = f"{settings.obsidian_labs_folder}/{sprint_folder_name}"
+            dropbox_path = f"{vault_path}/{sprint_folder}/{filename}.md"
+            relative_path = f"{sprint_folder}/{filename}.md"
 
             result = dbx.upload_file(markdown, dropbox_path, overwrite=True)
 
@@ -403,6 +405,7 @@ async def _sync_lms_materials(dbx, vault_path: str, settings: Settings) -> dict:
         ("tools", "lms:tools", "Инструменты"),
         ("prompts", "lms:prompts", "Промпты"),
         ("metaphors", "lms:metaphors", "Метафоры"),
+        ("speakers", "lms:speakers", "Эксперты"),
     ]
 
     for content_type, source_key, filename_base in material_types:
@@ -411,8 +414,10 @@ async def _sync_lms_materials(dbx, vault_path: str, settings: Settings) -> dict:
                 items = await _lms_source.get_tools()
             elif content_type == "prompts":
                 items = await _lms_source.get_prompts()
-            else:
+            elif content_type == "metaphors":
                 items = await _lms_source.get_metaphors()
+            else:
+                items = await _lms_source.get_speakers()
 
             if not items:
                 logger.info(f"Materials '{content_type}': no items found")
@@ -752,7 +757,8 @@ async def lifespan(app: FastAPI):
         _writer = ObsidianWriter(
             dropbox_client=dbx,
             vault_path=settings.dropbox_vault_path,
-            chats_folder=settings.obsidian_chats_folder,
+            labs_folder=settings.obsidian_labs_folder,
+            lab_name=settings.obsidian_lab_name,
         )
 
     # Initialize Telegram
@@ -852,7 +858,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Capture Bot",
     description="Автоматический сбор материалов из Telegram и LMS в Obsidian",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -973,4 +979,207 @@ async def status():
         "state": _state.get_all() if _state else {},
         "sources_configured": len(_settings.get_tg_sources()) if _settings else 0,
         "pipeline_enabled": _topic_extractor is not None,
+    }
+
+
+@app.get("/lms/needs-transcription")
+async def needs_transcription():
+    """List sessions that have video but no transcript."""
+    settings = get_settings()
+    lms = LmsSource(base_url=settings.lms_base_url)
+    sessions = await lms.get_sessions()
+
+    needs = []
+    for s in sessions:
+        if s.video and not s.transcript:
+            needs.append({
+                "id": s.id,
+                "title": s.title,
+                "video": s.video,
+            })
+
+    return {"count": len(needs), "sessions": needs}
+
+
+@app.get("/admin/migration-preview")
+async def migration_preview():
+    """Preview what would be moved without executing."""
+    return {
+        "info": "Call POST /admin/migrate-structure to execute",
+        "plan": {
+            "sessions": "W26 Winter 2026/*.md -> Лаборатории/w26 {lab}/",
+            "sprints": "W26 Winter 2026/Sprints/* -> Лаборатории/SPRINT {sprint}/",
+            "materials": "W26 Winter 2026/База знаний/tools,prompts,metaphors -> Материалы/",
+            "kb": "W26 Winter 2026/База знаний/kb-articles -> База знаний/",
+            "chats": "W26 Winter 2026/Чаты/* -> Лаборатории/w26 {lab}/Чаты/",
+            "preserved": "W26 Winter 2026/W1-W4/ — NOT MOVED (manual notes)",
+        }
+    }
+
+
+@app.post("/admin/migrate-structure")
+async def migrate_structure():
+    """One-time migration: move files from old structure to new."""
+    settings = get_settings()
+    dbx = DropboxClient(
+        settings.dropbox_app_key,
+        settings.dropbox_app_secret,
+        settings.dropbox_refresh_token,
+    )
+
+    vault = settings.dropbox_vault_path
+    base = f"{vault}/20 Projects/AI_Mindset"
+    old_w26 = f"{base}/W26 Winter 2026"
+    new_labs = f"{base}/Лаборатории"
+    new_lab = f"{new_labs}/w26 {{lab}}"
+    new_materials = f"{base}/Материалы"
+    new_kb = f"{base}/База знаний"
+
+    report = {"moved": [], "skipped": [], "errors": [], "deleted": []}
+
+    # Create target folders
+    for folder in [new_labs, new_lab, f"{new_lab}/Чаты", new_materials, new_kb]:
+        dbx.create_folder(folder)
+
+    # Create sprint subfolders
+    sprint_ids = ["pos", "automation", "bos", "vibe-coding", "music",
+                  "knowledge", "art", "research", "presentation", "coaching"]
+    for sid in sprint_ids:
+        dbx.create_folder(f"{new_labs}/{sid.upper()} {{sprint}}")
+
+    # Move sessions (24 files)
+    session_patterns = [
+        "WS00", "WS01", "WS02", "WS03", "WS04",
+        "AT01", "AT02", "AT03", "AT04", "AT05",
+        "BONUS01", "BONUS02", "BONUS03", "BONUS04",
+        "OH01", "OH02", "OH03", "OH04",
+        "FS01", "FS02", "FS03", "FS04",
+        "FOS18",
+    ]
+
+    # List files in old W26 folder
+    old_files = dbx.list_folder(old_w26) or []
+    for entry in old_files:
+        name = entry.name if hasattr(entry, 'name') else str(entry)
+        if not name.endswith('.md'):
+            continue
+        # Check if it's a session file
+        is_session = any(name.startswith(p) for p in session_patterns)
+        if is_session:
+            old_path = f"{old_w26}/{name}"
+            new_path = f"{new_lab}/{name}"
+            if not dbx.file_exists(new_path):
+                result = dbx.move_file(old_path, new_path)
+                if result:
+                    report["moved"].append(f"{name} -> Лаборатории/w26 {{lab}}/")
+                else:
+                    report["errors"].append(f"Failed to move {name}")
+            else:
+                report["skipped"].append(name)
+
+    # Move sprints (from Sprints/ to individual sprint folders)
+    old_sprints = f"{old_w26}/Sprints"
+    sprint_files = dbx.list_folder(old_sprints) or []
+    for entry in sprint_files:
+        name = entry.name if hasattr(entry, 'name') else str(entry)
+        if not name.endswith('.md'):
+            continue
+        # Extract sprint ID from filename (e.g., "POS POS.md" -> "POS")
+        sprint_id = name.split()[0] if ' ' in name else name.replace('.md', '')
+        old_path = f"{old_sprints}/{name}"
+        # New filename without duplication
+        new_filename = f"{sprint_id}.md"
+        new_path = f"{new_labs}/{sprint_id} {{sprint}}/{new_filename}"
+        if not dbx.file_exists(new_path):
+            result = dbx.move_file(old_path, new_path)
+            if result:
+                report["moved"].append(f"Sprints/{name} -> Лаборатории/{sprint_id} {{sprint}}/{new_filename}")
+            else:
+                report["errors"].append(f"Failed to move sprint {name}")
+        else:
+            report["skipped"].append(f"Sprint {name}")
+
+    # Move materials (tools, prompts, metaphors, speakers)
+    material_moves = {
+        "Инструменты.md": "Инструменты.md",
+        "Инструменты W26.md": "Инструменты.md",  # stale duplicate
+        "Промпты.md": "Промпты.md",
+        "Промпты W26.md": "Промпты.md",  # stale duplicate
+        "Метафоры.md": "Метафоры.md",
+        "Метафоры W26.md": "Метафоры.md",  # stale duplicate
+        "Спикеры W26.md": "Эксперты.md",
+    }
+    old_kb_path = f"{old_w26}/База знаний"
+    for old_name, new_name in material_moves.items():
+        old_path = f"{old_kb_path}/{old_name}"
+        new_path = f"{new_materials}/{new_name}"
+        if dbx.file_exists(old_path) and not dbx.file_exists(new_path):
+            result = dbx.move_file(old_path, new_path)
+            if result:
+                report["moved"].append(f"База знаний/{old_name} -> Материалы/{new_name}")
+            else:
+                report["errors"].append(f"Failed to move material {old_name}")
+        elif dbx.file_exists(old_path) and dbx.file_exists(new_path):
+            # Delete stale duplicate
+            dbx.delete_file(old_path)
+            report["deleted"].append(old_name)
+
+    # Move KB articles
+    kb_files = dbx.list_folder(old_kb_path) or []
+    for entry in kb_files:
+        name = entry.name if hasattr(entry, 'name') else str(entry)
+        if not name.endswith('.md'):
+            continue
+        # Skip already-moved materials
+        if name in material_moves:
+            continue
+        old_path = f"{old_kb_path}/{name}"
+        new_path = f"{new_kb}/{name}"
+        if not dbx.file_exists(new_path):
+            result = dbx.move_file(old_path, new_path)
+            if result:
+                report["moved"].append(f"База знаний/{name} -> База знаний/{name}")
+            else:
+                report["errors"].append(f"Failed to move KB {name}")
+        else:
+            report["skipped"].append(f"KB {name}")
+
+    # Move chats into lab
+    old_chats = f"{old_w26}/Чаты"
+    chat_files = dbx.list_folder(old_chats) or []
+    chat_rename = {
+        "w26 General.md": "General.md",
+        "w26 Support.md": "Support.md",
+        "w26 Intro.md": "Intro.md",
+        "w26 Materials-Org.md": "Materials-Org.md",
+        "w26 Advanced.md": "Advanced.md",
+        "w26 Корпоративный ИИ для команды.md": "Корпоративный ИИ для команды.md",
+        "w26 Корпоративный ИИ для команде.md": "Корпоративный ИИ для команды.md",
+        "w26 Учимся проектировать ПО.md": "Учимся проектировать ПО.md",
+    }
+    for entry in chat_files:
+        name = entry.name if hasattr(entry, 'name') else str(entry)
+        if not name.endswith('.md'):
+            continue
+        new_name = chat_rename.get(name, name)
+        old_path = f"{old_chats}/{name}"
+        new_path = f"{new_lab}/Чаты/{new_name}"
+        if not dbx.file_exists(new_path):
+            result = dbx.move_file(old_path, new_path)
+            if result:
+                report["moved"].append(f"Чаты/{name} -> w26 {{lab}}/Чаты/{new_name}")
+            else:
+                report["errors"].append(f"Failed to move chat {name}")
+        else:
+            report["skipped"].append(f"Chat {name}")
+
+    return {
+        "status": "completed",
+        "summary": {
+            "moved": len(report["moved"]),
+            "skipped": len(report["skipped"]),
+            "deleted": len(report["deleted"]),
+            "errors": len(report["errors"]),
+        },
+        "details": report,
     }

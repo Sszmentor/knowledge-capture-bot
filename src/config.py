@@ -38,20 +38,21 @@ class Settings(BaseSettings):
     tg_sources: str = Field(default='[]')
 
     # Vault paths (relative to dropbox_vault_path)
-    obsidian_chats_folder: str = Field(
-        default="20 Projects/AI_Mindset/W26 Winter 2026/Чаты"
+    # Project structure (mirrors LMS site navigation)
+    obsidian_project_root: str = Field(
+        default="20 Projects/AI_Mindset"
     )
-    obsidian_lms_folder: str = Field(
-        default="20 Projects/AI_Mindset/W26 Winter 2026"
+    obsidian_labs_folder: str = Field(
+        default="20 Projects/AI_Mindset/Лаборатории"
     )
-    obsidian_sprints_folder: str = Field(
-        default="20 Projects/AI_Mindset/W26 Winter 2026/Sprints"
+    obsidian_lab_name: str = Field(
+        default="w26 {lab}"
     )
     obsidian_materials_folder: str = Field(
-        default="20 Projects/AI_Mindset/W26 Winter 2026/База знаний"
+        default="20 Projects/AI_Mindset/Материалы"
     )
     obsidian_kb_folder: str = Field(
-        default="20 Projects/AI_Mindset/W26 Winter 2026/База знаний"
+        default="20 Projects/AI_Mindset/База знаний"
     )
 
     # State file path (relative to dropbox_vault_path)

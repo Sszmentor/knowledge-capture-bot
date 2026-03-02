@@ -152,6 +152,24 @@ def _format_prompts(prompts: list) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_transcript_section(transcript: str) -> str:
+    """Format transcript field — URL link or inline text."""
+    if not transcript:
+        return ""
+    if transcript.startswith("http"):
+        return f"\n## Транскрипт\n\n[Открыть транскрипт]({transcript})\n"
+    return f"\n## Транскрипт\n\n{transcript}\n"
+
+
+def _make_youtube_url(video: str) -> str:
+    """Guard for full/partial YouTube URLs."""
+    if not video:
+        return ""
+    if video.startswith("http"):
+        return video
+    return f"https://youtu.be/{video}"
+
+
 def _session_type_label(session_id: str) -> str:
     """Return human-readable session type."""
     if session_id.startswith("ws"):
@@ -220,19 +238,30 @@ status: {session.status}
     if meta_parts:
         parts.append(" · ".join(meta_parts) + "\n")
 
-    # Links
-    links = []
+    # Video callout (prominent, right after title)
+    lines = []
     if session.video:
-        links.append(
-            f"[YouTube](https://youtu.be/{session.video})"
-        )
-    if session.slides:
-        url = session.slides
-        if not url.startswith("http"):
-            url = f"{session.slides}"
-        links.append(f"[Слайды]({url})")
-    if links:
-        parts.append(" | ".join(links) + "\n")
+        video_url = _make_youtube_url(session.video)
+        lines.append("")
+        lines.append("> [!video] 🎥 Запись")
+        lines.append(f"> [Смотреть на YouTube]({video_url})")
+        if session.slides:
+            slides_url = session.slides if session.slides.startswith("http") else f"https://{session.slides}"
+            lines.append(f"> [Слайды]({slides_url})")
+        lines.append("")
+
+    if lines:
+        parts.extend(lines)
+
+    # Transcript
+    if hasattr(session, 'transcript') and session.transcript:
+        parts.append(_format_transcript_section(session.transcript))
+    elif session.video:
+        parts.append("")
+        parts.append("## Транскрипт")
+        parts.append("")
+        parts.append("- [ ] Требует транскрипции")
+        parts.append("")
 
     # TL;DR
     if session.tldr:
@@ -420,13 +449,17 @@ difficulty: {difficulty}
 def get_sprint_filename(data: dict) -> str:
     """Generate Obsidian filename for a sprint.
 
-    Format: SPRINT_ID Title
-    Example: POS POS Sprint
+    Format: SPRINT_ID
+    Example: POS
     """
     sprint_id = data.get("id", "sprint")
-    title = data.get("title", sprint_id.upper())
-    title = title.replace("/", "-").replace("\\", "-")
-    return f"{sprint_id.upper()} {title}"
+    return sprint_id.upper()
+
+
+def get_sprint_folder_name(data: dict) -> str:
+    """Generate subfolder name for a sprint: 'SPRINT_ID {sprint}'."""
+    sprint_id = data.get("id", "sprint")
+    return f"{sprint_id.upper()} {{sprint}}"
 
 
 def format_materials_page(content_type: str, items: list[dict]) -> str:
@@ -727,10 +760,8 @@ section: {section}
 def get_kb_article_filename(data: dict) -> str:
     """Generate Obsidian filename for a KB article.
 
-    Format: KB_ID Title
-    Example: vibe-01 Introduction to Vibe Coding
+    Format: KB_ID
+    Example: claude-code
     """
     article_id = data.get("id", "kb")
-    title = data.get("title", article_id)
-    title = title.replace("/", "-").replace("\\", "-")
-    return f"{article_id} {title}"
+    return article_id

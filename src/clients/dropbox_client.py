@@ -89,11 +89,45 @@ class DropboxClient:
             logger.error(f"Download error: {e}")
             return None
 
+    def move_file(self, from_path: str, to_path: str) -> Optional[str]:
+        """Move/rename a file in Dropbox."""
+        try:
+            result = self.dbx.files_move_v2(from_path, to_path, autorename=False)
+            logger.info(f"Moved: {from_path} -> {to_path}")
+            return result.metadata.path_display
+        except Exception as e:
+            logger.error(f"Move failed {from_path} -> {to_path}: {e}")
+            return None
+
+    def delete_file(self, dropbox_path: str) -> bool:
+        """Delete a file from Dropbox."""
+        try:
+            self.dbx.files_delete_v2(dropbox_path)
+            logger.info(f"Deleted: {dropbox_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Delete failed {dropbox_path}: {e}")
+            return False
+
+    def create_folder(self, folder_path: str) -> bool:
+        """Create folder if it doesn't exist."""
+        try:
+            self.dbx.files_create_folder_v2(folder_path)
+            logger.info(f"Created folder: {folder_path}")
+            return True
+        except Exception as e:
+            # Folder may already exist
+            if "path/conflict/folder" in str(e):
+                return True
+            logger.error(f"Create folder failed {folder_path}: {e}")
+            return False
+
     def file_exists(self, dropbox_path: str) -> bool:
+        """Check if a file exists at the given path."""
         try:
             self.dbx.files_get_metadata(dropbox_path)
             return True
-        except dropbox.exceptions.ApiError:
+        except Exception:
             return False
 
     def list_folder(self, folder_path: str) -> list:
