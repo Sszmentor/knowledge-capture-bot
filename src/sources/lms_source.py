@@ -5,11 +5,13 @@ in the JS bundle. Strategy:
 1. Fetch the index HTML to find the current JS bundle filename
 2. Download the JS bundle
 3. Extract session objects using regex + Node.js eval
-4. Return parsed session data as dicts
+4. Discover and download chunk files (sprints, labs, masterclasses, etc.)
+5. Return parsed session data as dicts
 """
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -29,6 +31,22 @@ SESSION_PATTERNS = [
     "fs01", "fs02", "fs03", "fs04",
     "fos18",
 ]
+
+# Known chunk prefixes to discover dynamically
+CHUNK_PREFIXES = [
+    "sprints",
+    "labs",
+    "masterclasses",
+    "programs",
+    "vibe-coding-kb",
+]
+
+# Const array variable names in the main bundle
+BUNDLE_CONST_ARRAYS = {
+    "tools": "tools$1",
+    "prompts": "PROMPTS",
+    "metaphors": "CORE_METAPHORS",
+}
 
 
 @dataclass
@@ -108,6 +126,8 @@ class LmsSource:
     def __init__(self, base_url: str = "https://learn.aimindset.org"):
         self.base_url = base_url.rstrip("/")
         self._bundle_content: Optional[str] = None
+        # prefix -> content string
+        self._chunks: dict[str, str] = {}
 
     async def fetch_bundle(self) -> str:
         """Download the main JS bundle from the LMS.
@@ -139,6 +159,66 @@ class LmsSource:
             )
             return self._bundle_content
 
+    async def fetch_chunks(self) -> dict[str, str]:
+        """Discover and download lazy-loaded chunk files.
+
+        Scans the main bundle for references to known chunk prefixes,
+        then downloads each found chunk. Chunk filename hashes change on
+        every rebuild, so we discover them dynamically.
+
+        Returns dict mapping prefix -> chunk content.
+        """
+        if not self._bundle_content:
+            await self.fetch_bundle()
+
+        content = self._bundle_content
+        found_chunks: dict[str, str] = {}
+
+        # Patterns to find chunk filenames in the bundle:
+        # "./sprints-HASH.js", "/assets/sprints-HASH.js", "sprints-HASH.js"
+        async with httpx.AsyncClient(timeout=30) as client:
+            for prefix in CHUNK_PREFIXES:
+                # Search for patterns like:
+                #   "./sprints-CqnLau8F.js"
+                #   "/assets/sprints-CqnLau8F.js"
+                #   "sprints-CqnLau8F.js"
+                # Vite uses hash patterns like: PREFIX-HASH8CHARS.js
+                pattern = re.compile(
+                    r'["\./](' + re.escape(prefix) + r'-[A-Za-z0-9_]+\.js)["\)]'
+                )
+                match = pattern.search(content)
+                if not match:
+                    logger.debug(
+                        f"Chunk prefix '{prefix}' not referenced in bundle"
+                    )
+                    continue
+
+                chunk_filename = match.group(1)
+                chunk_url = f"{self.base_url}/assets/{chunk_filename}"
+                logger.info(
+                    f"Found chunk: {chunk_filename} (prefix={prefix})"
+                )
+
+                try:
+                    resp = await client.get(chunk_url, timeout=30)
+                    resp.raise_for_status()
+                    found_chunks[prefix] = resp.text
+                    logger.info(
+                        f"Downloaded chunk '{prefix}': "
+                        f"{len(resp.text):,} chars"
+                    )
+                except httpx.HTTPError as e:
+                    logger.warning(
+                        f"Failed to download chunk '{prefix}' "
+                        f"({chunk_filename}): {e}"
+                    )
+
+        self._chunks = found_chunks
+        logger.info(
+            f"Chunks downloaded: {list(found_chunks.keys())}"
+        )
+        return found_chunks
+
     def _extract_raw_object(self, content: str, session_id: str) -> Optional[str]:
         """Extract raw JS object literal for a session from bundle."""
         pattern = f"{session_id}:{{id:"
@@ -158,6 +238,73 @@ class LmsSource:
                     return content[obj_start : i + 1]
         return None
 
+    def _extract_const_array(self, content: str, var_name: str) -> Optional[str]:
+        """Extract the raw JS array literal for a named const from a bundle.
+
+        Handles patterns:
+          const VAR_NAME=[{...}]
+          const VAR_NAME =[{...}]
+          const VAR_NAME= [{...}]
+
+        Returns the raw JS array string (starting with '['), or None.
+        """
+        # Escape dollar signs in var_name for regex
+        escaped = re.escape(var_name)
+        # Match: const VAR_NAME spaces* = spaces* [
+        pattern = re.compile(r"const\s+" + escaped + r"\s*=\s*(\[)")
+        match = pattern.search(content)
+        if not match:
+            logger.debug(f"const array '{var_name}' not found in content")
+            return None
+
+        # Start bracket is at match.start(1)
+        bracket_start = match.start(1)
+        bracket_count = 0
+        for i in range(bracket_start, min(bracket_start + 500000, len(content))):
+            ch = content[i]
+            if ch == "[":
+                bracket_count += 1
+            elif ch == "]":
+                bracket_count -= 1
+                if bracket_count == 0:
+                    return content[bracket_start : i + 1]
+        logger.warning(f"Could not find closing bracket for const '{var_name}'")
+        return None
+
+    def _extract_array_from_chunk(self, chunk_content: str) -> Optional[str]:
+        """Extract the primary exported array from a chunk file.
+
+        Chunks are minified Vite/Rollup output. They typically contain
+        one large array as the default export or a standalone const.
+        Strategy: find the first top-level '[{' array in the content.
+
+        Returns the raw JS array string or None.
+        """
+        # Try: export default [{...}]
+        match = re.search(r"export\s+default\s+(\[)", chunk_content)
+        if match:
+            start = match.start(1)
+        else:
+            # Try: first occurrence of '[{' which is likely the data array
+            match = re.search(r"(\[\{)", chunk_content)
+            if match:
+                start = match.start(1)
+            else:
+                logger.debug("No array pattern found in chunk")
+                return None
+
+        bracket_count = 0
+        for i in range(start, min(start + 1000000, len(chunk_content))):
+            ch = chunk_content[i]
+            if ch == "[":
+                bracket_count += 1
+            elif ch == "]":
+                bracket_count -= 1
+                if bracket_count == 0:
+                    return chunk_content[start : i + 1]
+        logger.warning("Could not find closing bracket for chunk array")
+        return None
+
     def _parse_via_node(self, js_objects: dict[str, str]) -> dict[str, dict]:
         """Parse JS object literals to JSON using Node.js.
 
@@ -169,7 +316,7 @@ class LmsSource:
         for session_id, raw_js in js_objects.items():
             try:
                 with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".js", delete=False
+                    mode="w", suffix=".js", delete=False, encoding="utf-8"
                 ) as f:
                     f.write(f"const obj = {raw_js};\n")
                     f.write("process.stdout.write(JSON.stringify(obj));\n")
@@ -180,6 +327,7 @@ class LmsSource:
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    encoding="utf-8",
                 )
 
                 if proc.returncode == 0:
@@ -191,8 +339,61 @@ class LmsSource:
                     )
             except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
                 logger.warning(f"Parse error for {session_id}: {e}")
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
         return results
+
+    def _parse_array_via_node(self, raw_js_array: str, label: str) -> Optional[list]:
+        """Parse a raw JS array literal to a Python list using Node.js.
+
+        Returns list of dicts or None on failure.
+        """
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".js", delete=False, encoding="utf-8"
+            ) as f:
+                f.write(f"const arr = {raw_js_array};\n")
+                f.write("process.stdout.write(JSON.stringify(arr));\n")
+                tmp_path = f.name
+
+            proc = subprocess.run(
+                ["node", tmp_path],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                encoding="utf-8",
+            )
+
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout)
+                if isinstance(data, list):
+                    return data
+                # Might be a single object or wrapped
+                if isinstance(data, dict):
+                    return [data]
+                logger.warning(
+                    f"Node.js returned unexpected type for '{label}': {type(data)}"
+                )
+                return None
+            else:
+                logger.warning(
+                    f"Node.js failed for array '{label}': {proc.stderr[:300]}"
+                )
+                return None
+        except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+            logger.warning(f"Parse error for array '{label}': {e}")
+            return None
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     async def get_sessions(self) -> list[LmsSession]:
         """Fetch and parse all LMS sessions.
@@ -227,6 +428,197 @@ class LmsSource:
 
         return sessions
 
+    async def get_sprints(self) -> list[dict]:
+        """Fetch and parse all sprints from the sprints chunk."""
+        if not self._chunks:
+            await self.fetch_chunks()
+
+        chunk = self._chunks.get("sprints")
+        if not chunk:
+            logger.warning("Sprints chunk not available")
+            return []
+
+        raw_array = self._extract_array_from_chunk(chunk)
+        if not raw_array:
+            logger.warning("Could not extract array from sprints chunk")
+            return []
+
+        result = self._parse_array_via_node(raw_array, "sprints")
+        if result is None:
+            return []
+
+        logger.info(f"Parsed {len(result)} sprints")
+        return result
+
+    async def get_labs(self) -> list[dict]:
+        """Fetch and parse all labs from the labs chunk."""
+        if not self._chunks:
+            await self.fetch_chunks()
+
+        chunk = self._chunks.get("labs")
+        if not chunk:
+            logger.warning("Labs chunk not available")
+            return []
+
+        raw_array = self._extract_array_from_chunk(chunk)
+        if not raw_array:
+            logger.warning("Could not extract array from labs chunk")
+            return []
+
+        result = self._parse_array_via_node(raw_array, "labs")
+        if result is None:
+            return []
+
+        logger.info(f"Parsed {len(result)} labs")
+        return result
+
+    async def get_masterclasses(self) -> list[dict]:
+        """Fetch and parse all masterclasses from the masterclasses chunk."""
+        if not self._chunks:
+            await self.fetch_chunks()
+
+        chunk = self._chunks.get("masterclasses")
+        if not chunk:
+            logger.warning("Masterclasses chunk not available")
+            return []
+
+        raw_array = self._extract_array_from_chunk(chunk)
+        if not raw_array:
+            logger.warning("Could not extract array from masterclasses chunk")
+            return []
+
+        result = self._parse_array_via_node(raw_array, "masterclasses")
+        if result is None:
+            return []
+
+        logger.info(f"Parsed {len(result)} masterclasses")
+        return result
+
+    async def get_programs(self) -> list[dict]:
+        """Fetch and parse all programs from the programs chunk."""
+        if not self._chunks:
+            await self.fetch_chunks()
+
+        chunk = self._chunks.get("programs")
+        if not chunk:
+            logger.warning("Programs chunk not available")
+            return []
+
+        raw_array = self._extract_array_from_chunk(chunk)
+        if not raw_array:
+            logger.warning("Could not extract array from programs chunk")
+            return []
+
+        result = self._parse_array_via_node(raw_array, "programs")
+        if result is None:
+            return []
+
+        logger.info(f"Parsed {len(result)} programs")
+        return result
+
+    async def get_vibe_coding_kb(self) -> list[dict]:
+        """Fetch and parse vibe-coding knowledge base from its chunk."""
+        if not self._chunks:
+            await self.fetch_chunks()
+
+        chunk = self._chunks.get("vibe-coding-kb")
+        if not chunk:
+            logger.warning("vibe-coding-kb chunk not available")
+            return []
+
+        raw_array = self._extract_array_from_chunk(chunk)
+        if not raw_array:
+            logger.warning("Could not extract array from vibe-coding-kb chunk")
+            return []
+
+        result = self._parse_array_via_node(raw_array, "vibe-coding-kb")
+        if result is None:
+            return []
+
+        logger.info(f"Parsed {len(result)} vibe-coding-kb items")
+        return result
+
+    async def get_tools(self) -> list[dict]:
+        """Parse tools array (tools$1) from the main bundle."""
+        if not self._bundle_content:
+            await self.fetch_bundle()
+
+        raw_array = self._extract_const_array(
+            self._bundle_content, BUNDLE_CONST_ARRAYS["tools"]
+        )
+        if not raw_array:
+            logger.warning("tools$1 array not found in bundle")
+            return []
+
+        result = self._parse_array_via_node(raw_array, "tools")
+        if result is None:
+            return []
+
+        logger.info(f"Parsed {len(result)} tools")
+        return result
+
+    async def get_prompts(self) -> list[dict]:
+        """Parse PROMPTS array from the main bundle."""
+        if not self._bundle_content:
+            await self.fetch_bundle()
+
+        raw_array = self._extract_const_array(
+            self._bundle_content, BUNDLE_CONST_ARRAYS["prompts"]
+        )
+        if not raw_array:
+            logger.warning("PROMPTS array not found in bundle")
+            return []
+
+        result = self._parse_array_via_node(raw_array, "prompts")
+        if result is None:
+            return []
+
+        logger.info(f"Parsed {len(result)} prompts")
+        return result
+
+    async def get_metaphors(self) -> list[dict]:
+        """Parse CORE_METAPHORS array from the main bundle."""
+        if not self._bundle_content:
+            await self.fetch_bundle()
+
+        raw_array = self._extract_const_array(
+            self._bundle_content, BUNDLE_CONST_ARRAYS["metaphors"]
+        )
+        if not raw_array:
+            logger.warning("CORE_METAPHORS array not found in bundle")
+            return []
+
+        result = self._parse_array_via_node(raw_array, "metaphors")
+        if result is None:
+            return []
+
+        logger.info(f"Parsed {len(result)} metaphors")
+        return result
+
+    async def get_all_content(self) -> dict:
+        """Fetch and parse all available LMS content.
+
+        Ensures bundle and chunks are downloaded once, then returns
+        a dict with all content categories.
+        """
+        # Pre-fetch bundle and all chunks in one pass
+        if not self._bundle_content:
+            await self.fetch_bundle()
+        if not self._chunks:
+            await self.fetch_chunks()
+
+        return {
+            "sessions": [s.raw for s in await self.get_sessions()],
+            "sprints": await self.get_sprints(),
+            "labs": await self.get_labs(),
+            "masterclasses": await self.get_masterclasses(),
+            "programs": await self.get_programs(),
+            "vibe_coding_kb": await self.get_vibe_coding_kb(),
+            "tools": await self.get_tools(),
+            "prompts": await self.get_prompts(),
+            "metaphors": await self.get_metaphors(),
+        }
+
     async def get_bundle_hash(self) -> str:
         """Get hash of the current bundle for change detection."""
         if not self._bundle_content:
@@ -234,3 +626,8 @@ class LmsSource:
         return hashlib.sha256(
             self._bundle_content.encode()
         ).hexdigest()[:16]
+
+    def content_hash_for(self, data: list | dict) -> str:
+        """Compute a short content hash for arbitrary parsed data."""
+        serialized = json.dumps(data, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(serialized.encode()).hexdigest()[:16]

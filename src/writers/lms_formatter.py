@@ -2,8 +2,13 @@
 
 Converts LmsSession data into structured Obsidian markdown documents
 with YAML frontmatter, chapters, tools, quotes, and other metadata.
+
+Also provides formatters for sprints, materials reference pages
+(tools/prompts/metaphors), and knowledge base articles.
 """
+import re
 from datetime import datetime
+from typing import Union
 
 from src.sources.lms_source import LmsSession
 
@@ -302,11 +307,430 @@ def get_session_filename(session: LmsSession) -> str:
     Format: SESSION_ID Title
     Example: WS01 Prompt Engineering
     """
-    import re
-
     title = session.title
     # Remove patterns like "WS01: ", "AT03: ", "Session 0: "
     title = re.sub(r"^[A-Za-z]+\s*\d+:\s*", "", title)
     # Remove characters unsafe for filenames
     title = title.replace("/", "-").replace("\\", "-")
     return f"{session.id.upper()} {title}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# New formatters for chunks and materials
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def format_sprint(data: dict) -> str:
+    """Format a sprint for Obsidian.
+
+    Produces a markdown document with YAML frontmatter and structured
+    sections derived from the sprint data dict.
+    """
+    today = datetime.now().strftime("%y.%m.%d")
+
+    sprint_id = data.get("id", "")
+    title = data.get("title", sprint_id.upper() if sprint_id else "Sprint")
+    description = data.get("description", data.get("desc", ""))
+    date_label = data.get("dateLabel", data.get("date", ""))
+    duration = data.get("duration", "")
+    difficulty = data.get("difficulty", "")
+    speakers = data.get("speakers", [])
+    if isinstance(speakers, str):
+        speakers = [speakers]
+    tools_list = data.get("tools", [])
+    link_details = data.get("linkDetails", data.get("link", ""))
+    status = data.get("status", "confirmed")
+    tags_extra = data.get("tags", [])
+
+    # Build tags
+    tags = ["type/sprint", "project/ai-mindset", "source/lms"]
+    if difficulty:
+        tags.append(f"difficulty/{difficulty}")
+    for t in tags_extra:
+        if t and f"tag/{t}" not in tags:
+            tags.append(f"tag/{t}")
+
+    tags_yaml = ", ".join(tags)
+
+    # YAML frontmatter
+    speakers_yaml = ", ".join(speakers) if speakers else ""
+    parts = [f"""---
+tags: [{tags_yaml}]
+created: {today}
+sprint_id: {sprint_id}
+status: {status}
+difficulty: {difficulty}
+---
+
+# {title}
+"""]
+
+    if description:
+        parts.append(f"*{description}*\n")
+
+    # Meta block
+    meta_lines = []
+    if date_label:
+        meta_lines.append(f"Дата: {date_label}")
+    if duration:
+        meta_lines.append(f"Длительность: {duration}")
+    if speakers_yaml:
+        meta_lines.append(f"Спикеры: {speakers_yaml}")
+    if difficulty:
+        meta_lines.append(f"Сложность: {difficulty}")
+
+    if meta_lines:
+        parts.append("\n".join(meta_lines) + "\n")
+
+    # Tools section
+    if tools_list:
+        parts.append("\n## Инструменты\n")
+        for tool in tools_list:
+            if isinstance(tool, dict):
+                name = tool.get("name", str(tool))
+                parts.append(f"- {name}")
+            else:
+                parts.append(f"- {tool}")
+        parts.append("")
+
+    # Modules / sessions inside the sprint
+    modules = data.get("modules", data.get("sessions", data.get("content", [])))
+    if modules and isinstance(modules, list):
+        parts.append("\n## Модули\n")
+        for mod in modules:
+            if isinstance(mod, dict):
+                mod_title = mod.get("title", mod.get("name", ""))
+                mod_desc = mod.get("description", mod.get("desc", ""))
+                if mod_title:
+                    if mod_desc:
+                        parts.append(f"- **{mod_title}** — {mod_desc}")
+                    else:
+                        parts.append(f"- **{mod_title}**")
+            else:
+                parts.append(f"- {mod}")
+        parts.append("")
+
+    # Links
+    if link_details:
+        parts.append(f"\n## Ссылки\n\n- [Подробнее]({link_details})\n")
+
+    return "\n".join(parts)
+
+
+def get_sprint_filename(data: dict) -> str:
+    """Generate Obsidian filename for a sprint.
+
+    Format: SPRINT_ID Title
+    Example: POS POS Sprint
+    """
+    sprint_id = data.get("id", "sprint")
+    title = data.get("title", sprint_id.upper())
+    title = title.replace("/", "-").replace("\\", "-")
+    return f"{sprint_id.upper()} {title}"
+
+
+def format_materials_page(content_type: str, items: list[dict]) -> str:
+    """Format a materials reference page for Obsidian.
+
+    Supports content_type: 'tools', 'prompts', 'metaphors', 'speakers'.
+
+    For tools: groups by tier (Essential / Power / Pro / Other) and
+    renders as a Markdown table.
+    For prompts: renders as titled code-block sections grouped by category.
+    For metaphors: renders as a numbered list.
+    For speakers: renders as a simple bio list.
+    """
+    today = datetime.now().strftime("%y.%m.%d")
+    total = len(items)
+
+    if content_type == "tools":
+        return _format_tools_page(items, today, total)
+    elif content_type == "prompts":
+        return _format_prompts_page(items, today, total)
+    elif content_type == "metaphors":
+        return _format_metaphors_page(items, today, total)
+    elif content_type == "speakers":
+        return _format_speakers_page(items, today, total)
+    else:
+        # Generic fallback
+        parts = [f"""---
+tags: [type/reference, project/ai-mindset, source/lms]
+created: {today}
+---
+
+# {content_type.capitalize()} ({total})
+"""]
+        for item in items:
+            if isinstance(item, dict):
+                name = item.get("name", item.get("title", str(item)))
+                parts.append(f"- {name}")
+            else:
+                parts.append(f"- {item}")
+        return "\n".join(parts) + "\n"
+
+
+def _format_tools_page(items: list[dict], today: str, total: int) -> str:
+    """Format tools as a tiered reference table."""
+    # Group by tier
+    tiers: dict[str, list[dict]] = {}
+    tier_order = ["essential", "power", "pro"]
+    for item in items:
+        tier = item.get("tier", "other").lower()
+        tiers.setdefault(tier, []).append(item)
+
+    # Build ordered list of tiers present
+    ordered_tiers = [t for t in tier_order if t in tiers]
+    for t in tiers:
+        if t not in ordered_tiers:
+            ordered_tiers.append(t)
+
+    parts = [f"""---
+tags: [type/reference, project/ai-mindset, source/lms]
+created: {today}
+---
+
+# Инструменты W26
+
+> {total} инструментов, упоминаемых в программе
+
+"""]
+
+    for tier in ordered_tiers:
+        tier_items = tiers[tier]
+        tier_label = tier.capitalize()
+        parts.append(f"## {tier_label}\n")
+        parts.append("| Инструмент | Категория | Модель оплаты |")
+        parts.append("|---|---|---|")
+        for tool in tier_items:
+            name = tool.get("name", "")
+            category = tool.get("category", "")
+            pricing = tool.get("pricing", tool.get("price", ""))
+            parts.append(f"| {name} | {category} | {pricing} |")
+        parts.append("")
+
+    return "\n".join(parts) + "\n"
+
+
+def _format_prompts_page(items: list[dict], today: str, total: int) -> str:
+    """Format prompts grouped by category."""
+    # Group by category
+    categories: dict[str, list[dict]] = {}
+    for item in items:
+        cat = item.get("category", item.get("type", "General"))
+        categories.setdefault(cat, []).append(item)
+
+    parts = [f"""---
+tags: [type/reference, project/ai-mindset, source/lms]
+created: {today}
+---
+
+# Промпты W26
+
+> {total} промптов из программы
+
+"""]
+
+    for cat, cat_items in categories.items():
+        parts.append(f"## {cat}\n")
+        for p in cat_items:
+            title = p.get("title", p.get("name", ""))
+            text = p.get("text", p.get("content", p.get("prompt", "")))
+            description = p.get("description", "")
+            if title:
+                parts.append(f"### {title}\n")
+            if description:
+                parts.append(f"{description}\n")
+            if text:
+                parts.append(f"```\n{text}\n```\n")
+
+    return "\n".join(parts) + "\n"
+
+
+def _format_metaphors_page(items: list[dict], today: str, total: int) -> str:
+    """Format metaphors as a numbered reference list."""
+    parts = [f"""---
+tags: [type/reference, project/ai-mindset, source/lms]
+created: {today}
+---
+
+# Метафоры W26
+
+> {total} метафор из программы
+
+"""]
+
+    for i, item in enumerate(items, start=1):
+        if isinstance(item, dict):
+            title = item.get("title", item.get("name", ""))
+            description = item.get(
+                "description", item.get("text", item.get("content", ""))
+            )
+            context = item.get("context", "")
+            parts.append(f"### {i}. {title}\n")
+            if description:
+                parts.append(f"{description}\n")
+            if context:
+                parts.append(f"*Контекст: {context}*\n")
+        else:
+            parts.append(f"{i}. {item}\n")
+
+    return "\n".join(parts) + "\n"
+
+
+def _format_speakers_page(items: list[dict], today: str, total: int) -> str:
+    """Format speakers as a bio list."""
+    parts = [f"""---
+tags: [type/reference, project/ai-mindset, source/lms]
+created: {today}
+---
+
+# Спикеры W26
+
+> {total} спикеров программы
+
+"""]
+
+    for item in items:
+        if isinstance(item, dict):
+            name = item.get("name", item.get("title", ""))
+            role = item.get("role", item.get("title", ""))
+            bio = item.get("bio", item.get("description", ""))
+            photo = item.get("photo", item.get("image", ""))
+            parts.append(f"## {name}\n")
+            if role:
+                parts.append(f"*{role}*\n")
+            if bio:
+                parts.append(f"{bio}\n")
+            if photo:
+                parts.append(f"![]({photo})\n")
+        else:
+            parts.append(f"- {item}\n")
+
+    return "\n".join(parts) + "\n"
+
+
+def format_kb_article(data: dict) -> str:
+    """Format a knowledge base article (vibe-coding-kb chapters) for Obsidian.
+
+    Produces a markdown document with YAML frontmatter. The data dict
+    may represent either a top-level KB section or an individual chapter.
+    """
+    today = datetime.now().strftime("%y.%m.%d")
+
+    article_id = data.get("id", "")
+    title = data.get("title", article_id or "KB Article")
+    description = data.get("description", data.get("desc", ""))
+    content_text = data.get("content", data.get("text", ""))
+    section = data.get("section", data.get("category", ""))
+    tags_extra = data.get("tags", [])
+    order = data.get("order", data.get("index", ""))
+    difficulty = data.get("difficulty", "")
+    examples = data.get("examples", [])
+    tips = data.get("tips", [])
+    links = data.get("links", data.get("resources", []))
+    chapters = data.get("chapters", [])
+
+    # Build tags
+    tags = ["type/kb-article", "project/ai-mindset", "source/lms", "topic/vibe-coding"]
+    if section:
+        clean_section = re.sub(r"[^\w-]", "-", section.lower())
+        tags.append(f"section/{clean_section}")
+    for t in tags_extra:
+        if t:
+            tags.append(f"tag/{t}")
+
+    tags_yaml = ", ".join(tags)
+
+    parts = [f"""---
+tags: [{tags_yaml}]
+created: {today}
+kb_id: {article_id}
+section: {section}
+---
+
+# {title}
+"""]
+
+    if description:
+        parts.append(f"*{description}*\n")
+
+    # Main content body
+    if content_text:
+        parts.append(f"\n{content_text}\n")
+
+    # Sub-chapters (if this is a section with chapters)
+    if chapters:
+        parts.append("\n## Разделы\n")
+        for ch in chapters:
+            if isinstance(ch, dict):
+                ch_title = ch.get("title", ch.get("name", ""))
+                ch_desc = ch.get("description", ch.get("desc", ""))
+                if ch_title:
+                    if ch_desc:
+                        parts.append(f"### {ch_title}\n\n{ch_desc}\n")
+                    else:
+                        parts.append(f"### {ch_title}\n")
+            else:
+                parts.append(f"- {ch}")
+
+    # Examples
+    if examples:
+        parts.append("\n## Примеры\n")
+        for ex in examples:
+            if isinstance(ex, dict):
+                ex_title = ex.get("title", ex.get("name", ""))
+                ex_code = ex.get("code", ex.get("content", ex.get("text", "")))
+                ex_desc = ex.get("description", "")
+                if ex_title:
+                    parts.append(f"### {ex_title}\n")
+                if ex_desc:
+                    parts.append(f"{ex_desc}\n")
+                if ex_code:
+                    lang = ex.get("lang", ex.get("language", ""))
+                    parts.append(f"```{lang}\n{ex_code}\n```\n")
+            else:
+                parts.append(f"```\n{ex}\n```\n")
+
+    # Tips
+    if tips:
+        parts.append("\n## Советы\n")
+        for tip in tips:
+            if isinstance(tip, dict):
+                tip_text = tip.get("text", tip.get("content", str(tip)))
+                parts.append(f"- {tip_text}")
+            else:
+                parts.append(f"- {tip}")
+        parts.append("")
+
+    # Links/Resources
+    if links:
+        parts.append("\n## Ссылки\n")
+        for link in links:
+            if isinstance(link, dict):
+                link_title = link.get("title", link.get("name", ""))
+                link_url = link.get("url", link.get("href", link.get("link", "")))
+                link_desc = link.get("description", "")
+                if link_url:
+                    line = f"- [{link_title}]({link_url})"
+                else:
+                    line = f"- {link_title}"
+                if link_desc:
+                    line += f" — {link_desc}"
+                parts.append(line)
+            else:
+                parts.append(f"- {link}")
+        parts.append("")
+
+    return "\n".join(parts) + "\n"
+
+
+def get_kb_article_filename(data: dict) -> str:
+    """Generate Obsidian filename for a KB article.
+
+    Format: KB_ID Title
+    Example: vibe-01 Introduction to Vibe Coding
+    """
+    article_id = data.get("id", "kb")
+    title = data.get("title", article_id)
+    title = title.replace("/", "-").replace("\\", "-")
+    return f"{article_id} {title}"

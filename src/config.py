@@ -44,6 +44,15 @@ class Settings(BaseSettings):
     obsidian_lms_folder: str = Field(
         default="20 Projects/AI_Mindset/W26 Winter 2026"
     )
+    obsidian_sprints_folder: str = Field(
+        default="20 Projects/AI_Mindset/W26 Winter 2026/Sprints"
+    )
+    obsidian_materials_folder: str = Field(
+        default="20 Projects/AI_Mindset/W26 Winter 2026/База знаний"
+    )
+    obsidian_kb_folder: str = Field(
+        default="20 Projects/AI_Mindset/W26 Winter 2026/База знаний"
+    )
 
     # State file path (relative to dropbox_vault_path)
     state_file_path: str = Field(

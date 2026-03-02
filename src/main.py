@@ -25,7 +25,15 @@ from src.notifier import (
 from src.sources.lms_source import LmsSource
 from src.sources.telegram_source import TelegramMessage, TelegramSource
 from src.state import SyncState
-from src.writers.lms_formatter import format_lms_session, get_session_filename
+from src.writers.lms_formatter import (
+    format_kb_article,
+    format_lms_session,
+    format_materials_page,
+    format_sprint,
+    get_kb_article_filename,
+    get_session_filename,
+    get_sprint_filename,
+)
 from src.writers.obsidian_writer import ObsidianWriter
 
 logger = logging.getLogger(__name__)
@@ -167,9 +175,13 @@ async def sync_telegram() -> dict:
 
 
 async def sync_lms() -> dict:
-    """Run LMS sync — fetch bundle, parse sessions, write to Obsidian.
+    """Run LMS sync — fetch bundle + chunks, parse all content, write to Obsidian.
 
-    Uses content hashing to detect changes per session.
+    Uses content hashing to detect changes per item.
+    Syncs: sessions, sprints, tools, prompts, metaphors, vibe-coding-kb.
+    Labs and masterclasses are fetched and counted but not written as
+    individual files (informational only — extend as needed).
+
     Returns dict with sync results.
     """
     global _last_lms_sync
@@ -181,13 +193,69 @@ async def sync_lms() -> dict:
         return {"error": "Not initialized"}
 
     dbx = _writer.dbx
-    lms_folder = settings.obsidian_lms_folder
     vault_path = settings.dropbox_vault_path
+
+    # ── Pre-fetch bundle and all chunks once ─────────────────────
+    try:
+        await _lms_source.fetch_bundle()
+    except Exception as e:
+        logger.exception(f"Failed to fetch LMS bundle: {e}")
+        return {"error": str(e)}
+
+    try:
+        await _lms_source.fetch_chunks()
+    except Exception as e:
+        logger.warning(f"Failed to fetch LMS chunks (continuing): {e}")
+
+    # ── Sessions ─────────────────────────────────────────────────
+    session_results = await _sync_lms_sessions(dbx, vault_path, settings)
+
+    # ── Sprints ──────────────────────────────────────────────────
+    sprint_results = await _sync_lms_sprints(dbx, vault_path, settings)
+
+    # ── Materials: tools, prompts, metaphors ─────────────────────
+    materials_results = await _sync_lms_materials(dbx, vault_path, settings)
+
+    # ── Vibe-coding KB ───────────────────────────────────────────
+    kb_results = await _sync_lms_kb(dbx, vault_path, settings)
+
+    # ── Informational: labs and masterclasses ────────────────────
+    info_results = await _sync_lms_info(settings)
+
+    _last_lms_sync = {
+        "timestamp": datetime.now().isoformat(),
+        "sessions": session_results,
+        "sprints": sprint_results,
+        "materials": materials_results,
+        "kb": kb_results,
+        "info": info_results,
+    }
+
+    total_updated = (
+        session_results.get("updated", 0)
+        + sprint_results.get("updated", 0)
+        + materials_results.get("updated", 0)
+        + kb_results.get("updated", 0)
+    )
+    logger.info(
+        f"LMS sync complete: {total_updated} items updated "
+        f"(sessions={session_results.get('updated', 0)}, "
+        f"sprints={sprint_results.get('updated', 0)}, "
+        f"materials={materials_results.get('updated', 0)}, "
+        f"kb={kb_results.get('updated', 0)})"
+    )
+    return _last_lms_sync
+
+
+async def _sync_lms_sessions(dbx, vault_path: str, settings: Settings) -> dict:
+    """Sync LMS sessions to obsidian_lms_folder."""
+    state = _state
+    lms_folder = settings.obsidian_lms_folder
 
     try:
         sessions = await _lms_source.get_sessions()
     except Exception as e:
-        logger.exception(f"Failed to fetch LMS sessions: {e}")
+        logger.exception(f"Failed to parse LMS sessions: {e}")
         return {"error": str(e)}
 
     updated = 0
@@ -198,7 +266,6 @@ async def sync_lms() -> dict:
     for session in sessions:
         source_key = f"lms:{session.id}"
         try:
-            # Check if content changed
             old_hash = state.get_content_hash(source_key)
             new_hash = session.content_hash
 
@@ -206,11 +273,8 @@ async def sync_lms() -> dict:
                 skipped += 1
                 continue
 
-            # Generate markdown
             markdown = format_lms_session(session)
             filename = get_session_filename(session)
-
-            # Write to Dropbox
             dropbox_path = f"{vault_path}/{lms_folder}/{filename}.md"
             relative_path = f"{lms_folder}/{filename}.md"
 
@@ -228,32 +292,305 @@ async def sync_lms() -> dict:
                     "status": "updated",
                     "path": relative_path,
                 }
-                logger.info(f"LMS: updated {session.id} → {filename}")
+                logger.info(f"LMS session: updated {session.id} → {filename}")
             else:
                 errors += 1
                 details[session.id] = {"error": "upload failed"}
-                logger.error(f"LMS: failed to upload {session.id}")
+                logger.error(f"LMS session: failed to upload {session.id}")
 
         except Exception as e:
             errors += 1
             details[session.id] = {"error": str(e)}
-            logger.exception(f"LMS: error processing {session.id}: {e}")
+            logger.exception(f"LMS session: error processing {session.id}: {e}")
 
-    _last_lms_sync = {
-        "timestamp": datetime.now().isoformat(),
-        "total_sessions": len(sessions),
+    logger.info(
+        f"Sessions: {updated} updated, {skipped} unchanged, {errors} errors "
+        f"(total {len(sessions)})"
+    )
+    return {
+        "total": len(sessions),
         "updated": updated,
         "skipped": skipped,
         "errors": errors,
         "details": details,
     }
 
+
+async def _sync_lms_sprints(dbx, vault_path: str, settings: Settings) -> dict:
+    """Sync LMS sprints to obsidian_sprints_folder."""
+    state = _state
+    sprints_folder = settings.obsidian_sprints_folder
+
+    try:
+        sprints = await _lms_source.get_sprints()
+    except Exception as e:
+        logger.exception(f"Failed to parse LMS sprints: {e}")
+        return {"error": str(e), "updated": 0}
+
+    if not sprints:
+        logger.info("No sprints found (chunk may not exist yet)")
+        return {"total": 0, "updated": 0, "skipped": 0, "errors": 0}
+
+    updated = 0
+    skipped = 0
+    errors = 0
+    details = {}
+
+    for sprint in sprints:
+        sprint_id = sprint.get("id", "")
+        source_key = f"lms:sprint:{sprint_id}"
+        try:
+            new_hash = _lms_source.content_hash_for(sprint)
+            old_hash = state.get_content_hash(source_key)
+
+            if old_hash == new_hash:
+                skipped += 1
+                continue
+
+            markdown = format_sprint(sprint)
+            filename = get_sprint_filename(sprint)
+            dropbox_path = f"{vault_path}/{sprints_folder}/{filename}.md"
+            relative_path = f"{sprints_folder}/{filename}.md"
+
+            result = dbx.upload_file(markdown, dropbox_path, overwrite=True)
+
+            if result:
+                state.update_lms(
+                    source_key=source_key,
+                    content_hash=new_hash,
+                    obsidian_path=relative_path,
+                )
+                updated += 1
+                title = sprint.get("title", sprint_id)
+                details[sprint_id] = {
+                    "title": title,
+                    "status": "updated",
+                    "path": relative_path,
+                }
+                logger.info(f"LMS sprint: updated {sprint_id} → {filename}")
+            else:
+                errors += 1
+                details[sprint_id] = {"error": "upload failed"}
+                logger.error(f"LMS sprint: failed to upload {sprint_id}")
+
+        except Exception as e:
+            errors += 1
+            details[sprint_id] = {"error": str(e)}
+            logger.exception(f"LMS sprint: error processing {sprint_id}: {e}")
+
     logger.info(
-        f"LMS sync complete: {updated} updated, "
-        f"{skipped} unchanged, {errors} errors "
-        f"(out of {len(sessions)} sessions)"
+        f"Sprints: {updated} updated, {skipped} unchanged, {errors} errors "
+        f"(total {len(sprints)})"
     )
-    return _last_lms_sync
+    return {
+        "total": len(sprints),
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+        "details": details,
+    }
+
+
+async def _sync_lms_materials(dbx, vault_path: str, settings: Settings) -> dict:
+    """Sync tools, prompts, and metaphors as reference pages."""
+    state = _state
+    materials_folder = settings.obsidian_materials_folder
+    updated = 0
+    errors = 0
+    details = {}
+
+    material_types = [
+        ("tools", "lms:tools", "Инструменты"),
+        ("prompts", "lms:prompts", "Промпты"),
+        ("metaphors", "lms:metaphors", "Метафоры"),
+    ]
+
+    for content_type, source_key, filename_base in material_types:
+        try:
+            if content_type == "tools":
+                items = await _lms_source.get_tools()
+            elif content_type == "prompts":
+                items = await _lms_source.get_prompts()
+            else:
+                items = await _lms_source.get_metaphors()
+
+            if not items:
+                logger.info(f"Materials '{content_type}': no items found")
+                details[content_type] = {"total": 0, "status": "empty"}
+                continue
+
+            new_hash = _lms_source.content_hash_for(items)
+            old_hash = state.get_content_hash(source_key)
+
+            if old_hash == new_hash:
+                details[content_type] = {
+                    "total": len(items),
+                    "status": "unchanged",
+                }
+                continue
+
+            markdown = format_materials_page(content_type, items)
+            dropbox_path = f"{vault_path}/{materials_folder}/{filename_base}.md"
+            relative_path = f"{materials_folder}/{filename_base}.md"
+
+            result = dbx.upload_file(markdown, dropbox_path, overwrite=True)
+
+            if result:
+                state.update_lms(
+                    source_key=source_key,
+                    content_hash=new_hash,
+                    obsidian_path=relative_path,
+                )
+                updated += 1
+                details[content_type] = {
+                    "total": len(items),
+                    "status": "updated",
+                    "path": relative_path,
+                }
+                logger.info(
+                    f"LMS materials: updated {content_type} "
+                    f"({len(items)} items) → {filename_base}.md"
+                )
+            else:
+                errors += 1
+                details[content_type] = {"error": "upload failed"}
+                logger.error(f"LMS materials: failed to upload {content_type}")
+
+        except Exception as e:
+            errors += 1
+            details[content_type] = {"error": str(e)}
+            logger.exception(
+                f"LMS materials: error processing {content_type}: {e}"
+            )
+
+    logger.info(
+        f"Materials: {updated} updated, {errors} errors"
+    )
+    return {
+        "updated": updated,
+        "errors": errors,
+        "details": details,
+    }
+
+
+async def _sync_lms_kb(dbx, vault_path: str, settings: Settings) -> dict:
+    """Sync vibe-coding knowledge base articles to obsidian_kb_folder."""
+    state = _state
+    kb_folder = settings.obsidian_kb_folder
+
+    try:
+        kb_items = await _lms_source.get_vibe_coding_kb()
+    except Exception as e:
+        logger.exception(f"Failed to parse vibe-coding-kb: {e}")
+        return {"error": str(e), "updated": 0}
+
+    if not kb_items:
+        logger.info("No KB articles found (chunk may not exist yet)")
+        return {"total": 0, "updated": 0, "skipped": 0, "errors": 0}
+
+    updated = 0
+    skipped = 0
+    errors = 0
+    details = {}
+
+    for article in kb_items:
+        article_id = article.get("id", "")
+        source_key = f"lms:kb:{article_id}"
+        try:
+            new_hash = _lms_source.content_hash_for(article)
+            old_hash = state.get_content_hash(source_key)
+
+            if old_hash == new_hash:
+                skipped += 1
+                continue
+
+            markdown = format_kb_article(article)
+            filename = get_kb_article_filename(article)
+            dropbox_path = f"{vault_path}/{kb_folder}/{filename}.md"
+            relative_path = f"{kb_folder}/{filename}.md"
+
+            result = dbx.upload_file(markdown, dropbox_path, overwrite=True)
+
+            if result:
+                state.update_lms(
+                    source_key=source_key,
+                    content_hash=new_hash,
+                    obsidian_path=relative_path,
+                )
+                updated += 1
+                title = article.get("title", article_id)
+                details[article_id] = {
+                    "title": title,
+                    "status": "updated",
+                    "path": relative_path,
+                }
+                logger.info(f"LMS KB: updated {article_id} → {filename}")
+            else:
+                errors += 1
+                details[article_id] = {"error": "upload failed"}
+                logger.error(f"LMS KB: failed to upload {article_id}")
+
+        except Exception as e:
+            errors += 1
+            details[article_id] = {"error": str(e)}
+            logger.exception(
+                f"LMS KB: error processing {article_id}: {e}"
+            )
+
+    logger.info(
+        f"KB articles: {updated} updated, {skipped} unchanged, {errors} errors "
+        f"(total {len(kb_items)})"
+    )
+    return {
+        "total": len(kb_items),
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+        "details": details,
+    }
+
+
+async def _sync_lms_info(settings: Settings) -> dict:
+    """Fetch labs and masterclasses for informational count only.
+
+    These are not written as individual files but their counts are
+    included in the sync report. Extend this function to write them
+    if needed in the future.
+    """
+    info: dict = {}
+
+    try:
+        labs = await _lms_source.get_labs()
+        info["labs"] = {"total": len(labs)}
+        if labs:
+            logger.info(f"LMS labs (informational): {len(labs)} found")
+    except Exception as e:
+        logger.warning(f"Could not fetch labs: {e}")
+        info["labs"] = {"error": str(e)}
+
+    try:
+        masterclasses = await _lms_source.get_masterclasses()
+        info["masterclasses"] = {"total": len(masterclasses)}
+        if masterclasses:
+            logger.info(
+                f"LMS masterclasses (informational): {len(masterclasses)} found"
+            )
+    except Exception as e:
+        logger.warning(f"Could not fetch masterclasses: {e}")
+        info["masterclasses"] = {"error": str(e)}
+
+    try:
+        programs = await _lms_source.get_programs()
+        info["programs"] = {"total": len(programs)}
+        if programs:
+            logger.info(
+                f"LMS programs (informational): {len(programs)} found"
+            )
+    except Exception as e:
+        logger.warning(f"Could not fetch programs: {e}")
+        info["programs"] = {"error": str(e)}
+
+    return info
 
 
 async def _extract_and_save_topics(
@@ -515,7 +852,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Capture Bot",
     description="Автоматический сбор материалов из Telegram и LMS в Obsidian",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
