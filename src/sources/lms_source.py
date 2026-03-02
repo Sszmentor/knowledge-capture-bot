@@ -434,6 +434,25 @@ class LmsSource:
 
         return sessions
 
+    async def get_speakers(self) -> list[dict]:
+        """Extract unique speakers from sessions."""
+        sessions = await self.get_sessions()
+        speakers_map = {}
+        for s in sessions:
+            # Collect from speakers list
+            for sp in s.speakers:
+                if sp and sp not in speakers_map:
+                    speakers_map[sp] = {"name": sp, "sessions": []}
+                if sp:
+                    speakers_map[sp]["sessions"].append(s.title)
+            # Also check single speaker field
+            if s.speaker and s.speaker not in speakers_map:
+                speakers_map[s.speaker] = {"name": s.speaker, "sessions": []}
+            if s.speaker and s.speaker in speakers_map:
+                if s.title not in speakers_map[s.speaker]["sessions"]:
+                    speakers_map[s.speaker]["sessions"].append(s.title)
+        return list(speakers_map.values())
+
     async def get_sprints(self) -> list[dict]:
         """Fetch and parse all sprints from the sprints chunk."""
         if not self._chunks:
