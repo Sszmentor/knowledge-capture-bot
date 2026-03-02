@@ -41,9 +41,10 @@ CHUNK_PREFIXES = [
     "vibe-coding-kb",
 ]
 
-# Const array variable names in the main bundle
+# Const array variable names in the main bundle.
+# "tools" uses a special non-const pattern: ],tools=[{id:
 BUNDLE_CONST_ARRAYS = {
-    "tools": "tools$1",
+    "tools": "tools",
     "prompts": "PROMPTS",
     "metaphors": "CORE_METAPHORS",
 }
@@ -239,22 +240,27 @@ class LmsSource:
         return None
 
     def _extract_const_array(self, content: str, var_name: str) -> Optional[str]:
-        """Extract the raw JS array literal for a named const from a bundle.
+        """Extract the raw JS array literal for a named variable from a bundle.
 
         Handles patterns:
           const VAR_NAME=[{...}]
           const VAR_NAME =[{...}]
-          const VAR_NAME= [{...}]
+          ],VAR_NAME=[{...}]     (non-const, part of expression)
+          ,VAR_NAME=[{...}]
 
         Returns the raw JS array string (starting with '['), or None.
         """
         # Escape dollar signs in var_name for regex
         escaped = re.escape(var_name)
-        # Match: const VAR_NAME spaces* = spaces* [
+        # Try 1: const VAR_NAME spaces* = spaces* [
         pattern = re.compile(r"const\s+" + escaped + r"\s*=\s*(\[)")
         match = pattern.search(content)
         if not match:
-            logger.debug(f"const array '{var_name}' not found in content")
+            # Try 2: non-const pattern — ],VAR_NAME=[ or ,VAR_NAME=[
+            pattern2 = re.compile(r"[\],;]" + escaped + r"=(\[)")
+            match = pattern2.search(content)
+        if not match:
+            logger.debug(f"array '{var_name}' not found in content")
             return None
 
         # Start bracket is at match.start(1)
