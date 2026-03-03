@@ -278,13 +278,15 @@ async def _sync_lms_sessions(dbx, vault_path: str, settings: Settings) -> dict:
             filename = get_session_filename(session)
 
             # Determine subfolder within the lab based on session type
-            session_id = session.id.upper() if session.id else ""
-            if session_id.startswith("WS") or session_id.startswith("BONUS"):
+            sid = session.id.lower() if session.id else ""
+            if sid.startswith("ws") or sid.startswith("bonus"):
                 subfolder = f"{lms_folder}/Workshops"
-            elif session_id.startswith("AT"):
+            elif sid.startswith("at"):
                 subfolder = f"{lms_folder}/Advanced"
-            elif session_id.startswith("OH"):
+            elif sid.startswith("oh"):
                 subfolder = f"{lms_folder}/Office Hours"
+            elif sid.startswith("fs") or sid.startswith("fos"):
+                subfolder = f"{lms_folder}/Focus Sessions"
             else:
                 subfolder = lms_folder
 
@@ -417,10 +419,10 @@ async def _sync_lms_materials(dbx, vault_path: str, settings: Settings) -> dict:
     details = {}
 
     material_types = [
-        ("tools", "lms:tools", "Инструменты"),
-        ("prompts", "lms:prompts", "Промпты"),
-        ("metaphors", "lms:metaphors", "Метафоры"),
-        ("speakers", "lms:speakers", "Эксперты"),
+        ("tools", "lms:tools", "инструменты"),
+        ("prompts", "lms:prompts", "промпты"),
+        ("metaphors", "lms:metaphors", "метафоры"),
+        ("speakers", "lms:speakers", "эксперты"),
     ]
 
     for content_type, source_key, filename_base in material_types:
@@ -873,7 +875,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Capture Bot",
     description="Автоматический сбор материалов из Telegram и LMS в Obsidian",
-    version="1.5.0",
+    version="1.5.1",
     lifespan=lifespan,
 )
 

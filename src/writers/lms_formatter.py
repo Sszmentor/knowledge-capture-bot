@@ -330,18 +330,39 @@ status: {session.status}
     return "\n".join(parts)
 
 
-def get_session_filename(session: LmsSession) -> str:
-    """Generate Obsidian filename for a session.
+# LMS navigation labels — exactly mirrors website sidebar.
+# Key = session.id (lowercase), value = filename (without .md).
+LMS_NAV_LABELS: dict[str, str] = {
+    "ws00": "ws00 intro",
+    "ws01": "ws01 prompt",
+    "ws02": "ws02 context",
+    "ws03": "ws03 mind",
+    "ws04": "ws04 life",
+    "bonus01": "ws-b bonus 1",
+    "bonus02": "ws-b bonus 2",
+    "at01": "at01 coach",
+    "at02": "at02 agents",
+    "at03": "at03 vibe",
+    "at04": "at04 create",
+    "at05": "at05 ai os",
+    "oh01": "oh01",
+    "oh02": "oh02",
+    "oh03": "oh03",
+    "oh04": "oh04",
+}
 
-    Format: SESSION_ID Title
-    Example: WS01 Prompt Engineering
+
+def get_session_filename(session: LmsSession) -> str:
+    """Generate Obsidian filename matching LMS navigation label.
+
+    Uses LMS_NAV_LABELS lookup; falls back to lowercase session.id.
     """
-    title = session.title
-    # Remove patterns like "WS01: ", "AT03: ", "Session 0: "
-    title = re.sub(r"^[A-Za-z]+\s*\d+:\s*", "", title)
-    # Remove characters unsafe for filenames
-    title = title.replace("/", "-").replace("\\", "-")
-    return f"{session.id.upper()} {title}"
+    sid = session.id.lower() if session.id else ""
+    label = LMS_NAV_LABELS.get(sid)
+    if label:
+        return label
+    # Fallback for sessions not in nav (focus sessions, etc.)
+    return sid
 
 
 # ─────────────────────────────────────────────────────────────────────────────
