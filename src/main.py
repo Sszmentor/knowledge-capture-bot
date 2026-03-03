@@ -365,7 +365,7 @@ async def _sync_lms_sprints(dbx, vault_path: str, settings: Settings) -> dict:
             if sprint_id.lower() == "pos":
                 sprint_folder = f"{settings.obsidian_labs_folder}/{sprint_folder_name}"
             else:
-                sprint_folder = f"{settings.obsidian_labs_folder}/{settings.obsidian_lab_name}/{sprint_folder_name}"
+                sprint_folder = f"{settings.obsidian_labs_folder}/{settings.obsidian_lab_name}/Sprints/{sprint_folder_name}"
             dropbox_path = f"{vault_path}/{sprint_folder}/{filename}.md"
             relative_path = f"{sprint_folder}/{filename}.md"
 
