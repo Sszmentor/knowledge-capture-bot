@@ -276,8 +276,20 @@ async def _sync_lms_sessions(dbx, vault_path: str, settings: Settings) -> dict:
 
             markdown = format_lms_session(session)
             filename = get_session_filename(session)
-            dropbox_path = f"{vault_path}/{lms_folder}/{filename}.md"
-            relative_path = f"{lms_folder}/{filename}.md"
+
+            # Determine subfolder within the lab based on session type
+            session_id = session.id.upper() if session.id else ""
+            if session_id.startswith("WS") or session_id.startswith("BONUS"):
+                subfolder = f"{lms_folder}/Workshops"
+            elif session_id.startswith("AT"):
+                subfolder = f"{lms_folder}/Advanced"
+            elif session_id.startswith("OH"):
+                subfolder = f"{lms_folder}/Office Hours"
+            else:
+                subfolder = lms_folder
+
+            dropbox_path = f"{vault_path}/{subfolder}/{filename}.md"
+            relative_path = f"{subfolder}/{filename}.md"
 
             result = dbx.upload_file(markdown, dropbox_path, overwrite=True)
 
