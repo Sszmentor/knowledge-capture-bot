@@ -153,11 +153,23 @@ def _format_prompts(prompts: list) -> str:
 
 
 def _format_transcript_section(transcript: str) -> str:
-    """Format transcript field — URL link or inline text."""
+    """Format transcript field — full text, URL link, or LMS path link."""
     if not transcript:
         return ""
+
+    # Full transcript text (enriched by transcript_fetcher)
+    if len(transcript) > 500 and not transcript.startswith("/") and not transcript.startswith("http"):
+        return f"\n## Транскрипт\n\n> Источник: LMS\n\n{transcript}\n"
+
+    # URL link
     if transcript.startswith("http"):
         return f"\n## Транскрипт\n\n[Открыть транскрипт]({transcript})\n"
+
+    # LMS path — convert to full URL
+    if transcript.startswith("/"):
+        url = f"https://learn.aimindset.org{transcript}"
+        return f"\n## Транскрипт\n\n[Открыть транскрипт]({url})\n"
+
     return f"\n## Транскрипт\n\n{transcript}\n"
 
 
@@ -277,6 +289,10 @@ status: {session.status}
         for topic in session.key_topics:
             parts.append(f"- {topic}")
         parts.append("")
+
+    # Metaphor
+    if session.metaphor:
+        parts.append(f"\n## Метафора\n\n{session.metaphor}\n")
 
     # Chapters
     chapters_md = _format_chapters(session.chapters, session.video)

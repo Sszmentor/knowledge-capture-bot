@@ -4,8 +4,10 @@ Polls Telegram chats (2h) and LMS (6h), writes new content
 to Obsidian vault via Dropbox API.
 """
 import asyncio
+import hashlib
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -22,6 +24,8 @@ from src.notifier import (
     record_tg_sync,
     record_topics,
 )
+from src.services.transcript_fetcher import fetch_lms_transcript, is_full_transcript_text
+from src.services.youtube_transcript import extract_video_id, fetch_youtube_transcript
 from src.sources.lms_source import LmsSource
 from src.sources.telegram_source import TelegramMessage, TelegramSource
 from src.state import SyncState
@@ -267,8 +271,36 @@ async def _sync_lms_sessions(dbx, vault_path: str, settings: Settings) -> dict:
     for session in sessions:
         source_key = f"lms:{session.id}"
         try:
+            # ── Transcript enrichment ─────────────────────────────
+            # Priority: LMS transcript file → YouTube → keep as-is
+            if session.transcript and not is_full_transcript_text(session.transcript):
+                lms_text = fetch_lms_transcript(session.transcript)
+                if lms_text:
+                    session.transcript = lms_text
+                    logger.info(f"LMS transcript enriched: {session.id} ({len(lms_text)} chars)")
+                elif session.video:
+                    vid = extract_video_id(session.video)
+                    if vid:
+                        yt_text = fetch_youtube_transcript(vid)
+                        if yt_text:
+                            session.transcript = yt_text
+                            logger.info(f"YouTube transcript fallback: {session.id}")
+                # Rate limit between LMS requests
+                time.sleep(1)
+            elif not session.transcript and session.video:
+                vid = extract_video_id(session.video)
+                if vid:
+                    yt_text = fetch_youtube_transcript(vid)
+                    if yt_text:
+                        session.transcript = yt_text
+                        logger.info(f"YouTube transcript (no LMS path): {session.id}")
+                time.sleep(1)
+
+            # ── Hash: include transcript in change detection ──────
             old_hash = state.get_content_hash(source_key)
-            new_hash = session.content_hash
+            hash_input = json.dumps(session.raw, sort_keys=True, ensure_ascii=False)
+            hash_input += session.transcript or ""
+            new_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
             if old_hash == new_hash:
                 skipped += 1
@@ -875,7 +907,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Capture Bot",
     description="Автоматический сбор материалов из Telegram и LMS в Obsidian",
-    version="1.5.1",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -1016,6 +1048,35 @@ async def needs_transcription():
             })
 
     return {"count": len(needs), "sessions": needs}
+
+
+@app.post("/admin/force-resync-lms")
+async def force_resync_lms():
+    """Clear LMS content hashes to force full re-sync on next run.
+
+    Use after adding new features (e.g. transcripts) to update all notes.
+    """
+    state = _state
+    if not state:
+        return {"error": "Not initialized"}
+
+    all_state = state.get_all()
+    cleared = 0
+    for key in list(all_state.keys()):
+        if key.startswith("lms:") and not key.startswith("lms:sprint:") and not key.startswith("lms:kb:") and key not in ("lms:tools", "lms:prompts", "lms:metaphors", "lms:speakers"):
+            entry = all_state[key]
+            if "content_hash" in entry:
+                entry["content_hash"] = ""
+                cleared += 1
+
+    state._save()
+    logger.info(f"Force resync: cleared {cleared} LMS session hashes")
+
+    return {
+        "status": "ok",
+        "cleared_hashes": cleared,
+        "next_step": "POST /sync/lms to apply",
+    }
 
 
 @app.get("/admin/migration-preview")
