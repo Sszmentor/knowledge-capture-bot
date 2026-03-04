@@ -30,6 +30,10 @@ def fetch_lms_transcript(transcript_path: str) -> str:
     if not transcript_path:
         return ""
 
+    # Ensure path starts with /
+    if not transcript_path.startswith("/"):
+        transcript_path = f"/transcripts/{transcript_path}"
+
     # Try with .md extension first, then without
     urls_to_try = []
     base_url = f"{LMS_BASE}{transcript_path}"
