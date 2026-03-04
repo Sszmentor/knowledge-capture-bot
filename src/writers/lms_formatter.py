@@ -184,17 +184,21 @@ def _make_youtube_url(video: str) -> str:
 
 def _session_type_label(session_id: str) -> str:
     """Return human-readable session type."""
-    if session_id.startswith("ws"):
+    # Strip sprint prefix (pos-ws01 → ws01) to reuse type logic
+    sid = session_id
+    if sid.startswith("pos-"):
+        sid = sid[4:]  # "pos-ws01" → "ws01", "pos-oh" → "oh"
+    if sid.startswith("ws") or sid.startswith("intro"):
         return "workshop"
-    elif session_id.startswith("at"):
+    elif sid.startswith("at"):
         return "advanced"
-    elif session_id.startswith("bonus"):
-        return "bonus"
-    elif session_id.startswith("oh"):
+    elif sid.startswith("bonus"):
+        return "workshop"
+    elif sid.startswith("oh"):
         return "office-hours"
-    elif session_id.startswith("fs"):
+    elif sid.startswith("fs"):
         return "focus-session"
-    elif session_id.startswith("fos"):
+    elif sid.startswith("fos"):
         return "founder-os"
     return "session"
 
@@ -349,6 +353,7 @@ status: {session.status}
 # LMS navigation labels — exactly mirrors website sidebar.
 # Key = session.id (lowercase), value = filename (without .md).
 LMS_NAV_LABELS: dict[str, str] = {
+    # w26 lab
     "ws00": "ws00 intro",
     "ws01": "ws01 prompt",
     "ws02": "ws02 context",
@@ -365,6 +370,16 @@ LMS_NAV_LABELS: dict[str, str] = {
     "oh02": "oh02",
     "oh03": "oh03",
     "oh04": "oh04",
+    # POS sprint
+    "pos-intro": "pos-intro",
+    "pos-ws01": "pos-ws01",
+    "pos-ws02": "pos-ws02",
+    "pos-ws03": "pos-ws03",
+    "pos-ws04": "pos-ws04",
+    "pos-fs01": "pos-fs01",
+    "pos-oh": "pos-oh",
+    "pos-bonus01": "pos-bonus01",
+    "pos-bonus02": "pos-bonus02",
 }
 
 

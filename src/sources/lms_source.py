@@ -24,12 +24,16 @@ logger = logging.getLogger(__name__)
 
 # All known session ID patterns in the LMS bundle
 SESSION_PATTERNS = [
+    # w26 lab sessions
     "ws00", "ws01", "ws02", "ws03", "ws04",
     "at01", "at02", "at03", "at04", "at05",
     "bonus01", "bonus02", "bonus03", "bonus04",
     "oh01", "oh02", "oh03", "oh04",
     "fs01", "fs02", "fs03", "fs04",
     "fos18",
+    # POS sprint sessions
+    "pos-intro", "pos-ws01", "pos-ws02", "pos-ws03", "pos-ws04",
+    "pos-fs01", "pos-oh", "pos-bonus01", "pos-bonus02",
 ]
 
 # Known chunk prefixes to discover dynamically
@@ -221,14 +225,28 @@ class LmsSource:
         return found_chunks
 
     def _extract_raw_object(self, content: str, session_id: str) -> Optional[str]:
-        """Extract raw JS object literal for a session from bundle."""
+        """Extract raw JS object literal for a session from bundle.
+
+        Handles both unquoted keys (ws01:{id:) and quoted keys
+        ("pos-intro":{id:) for IDs containing hyphens.
+        """
+        # Try unquoted first (e.g. ws01:{id:)
         pattern = f"{session_id}:{{id:"
         try:
             start = content.index(pattern)
+            obj_start = start + len(session_id) + 1
         except ValueError:
-            return None
-
-        obj_start = start + len(session_id) + 1
+            # Try quoted key (e.g. "pos-intro":{id:)
+            for quote in ['"', "'"]:
+                quoted_pattern = f"{quote}{session_id}{quote}:{{id:"
+                try:
+                    start = content.index(quoted_pattern)
+                    obj_start = start + len(session_id) + 3  # +2 for quotes, +1 for colon
+                    break
+                except ValueError:
+                    continue
+            else:
+                return None
         brace_count = 0
         for i in range(obj_start, min(obj_start + 50000, len(content))):
             if content[i] == "{":

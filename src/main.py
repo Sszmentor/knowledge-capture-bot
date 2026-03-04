@@ -311,7 +311,10 @@ async def _sync_lms_sessions(dbx, vault_path: str, settings: Settings) -> dict:
 
             # Determine subfolder within the lab based on session type
             sid = session.id.lower() if session.id else ""
-            if sid.startswith("ws") or sid.startswith("bonus"):
+            if sid.startswith("pos-"):
+                # POS sprint sessions → Лаборатории/POS {sprint}/
+                subfolder = f"{settings.obsidian_labs_folder}/POS {{sprint}}"
+            elif sid.startswith("ws") or sid.startswith("bonus"):
                 subfolder = f"{lms_folder}/Workshops"
             elif sid.startswith("at"):
                 subfolder = f"{lms_folder}/Advanced"
@@ -907,7 +910,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Capture Bot",
     description="Автоматический сбор материалов из Telegram и LMS в Obsidian",
-    version="1.6.0",
+    version="1.6.1",
     lifespan=lifespan,
 )
 
