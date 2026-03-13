@@ -24,6 +24,11 @@ from src.notifier import (
     record_tg_sync,
     record_topics,
 )
+from src.services.book_fetcher import (
+    fetch_automation_book,
+    fetch_vibe_coding_book,
+    format_book_for_obsidian,
+)
 from src.services.transcript_fetcher import fetch_lms_transcript, is_full_transcript_text
 from src.services.youtube_transcript import extract_video_id, fetch_youtube_transcript
 from src.sources.lms_source import LmsSource
@@ -224,6 +229,9 @@ async def sync_lms() -> dict:
     # ── Vibe-coding KB ───────────────────────────────────────────
     kb_results = await _sync_lms_kb(dbx, vault_path, settings)
 
+    # ── Books: Automation 101, Vibe-coding 101 ──────────────────
+    books_results = await _sync_lms_books(dbx, vault_path, settings)
+
     # ── Informational: labs and masterclasses ────────────────────
     info_results = await _sync_lms_info(settings)
 
@@ -233,6 +241,7 @@ async def sync_lms() -> dict:
         "sprints": sprint_results,
         "materials": materials_results,
         "kb": kb_results,
+        "books": books_results,
         "info": info_results,
     }
 
@@ -241,13 +250,15 @@ async def sync_lms() -> dict:
         + sprint_results.get("updated", 0)
         + materials_results.get("updated", 0)
         + kb_results.get("updated", 0)
+        + books_results.get("updated", 0)
     )
     logger.info(
         f"LMS sync complete: {total_updated} items updated "
         f"(sessions={session_results.get('updated', 0)}, "
         f"sprints={sprint_results.get('updated', 0)}, "
         f"materials={materials_results.get('updated', 0)}, "
-        f"kb={kb_results.get('updated', 0)})"
+        f"kb={kb_results.get('updated', 0)}, "
+        f"books={books_results.get('updated', 0)})"
     )
     return _last_lms_sync
 
@@ -607,6 +618,130 @@ async def _sync_lms_kb(dbx, vault_path: str, settings: Settings) -> dict:
     }
 
 
+async def _sync_lms_books(dbx, vault_path: str, settings: Settings) -> dict:
+    """Sync structured books (Automation 101, Vibe-coding 101) to KB folder.
+
+    Fetches chapter content from individual JS chunks and writes as
+    single comprehensive Obsidian documents.
+    """
+    state = _state
+    kb_folder = settings.obsidian_kb_folder
+    updated = 0
+    errors = 0
+    details = {}
+
+    bundle_content = _lms_source._bundle_content
+    if not bundle_content:
+        return {"error": "Bundle not loaded", "updated": 0}
+
+    # ── Automation 101 ────────────────────────────────────────────
+    try:
+        auto_blocks = await fetch_automation_book(bundle_content)
+        if auto_blocks:
+            total_chars = sum(
+                len(ch.content) for b in auto_blocks for ch in b.chapters
+            )
+            if total_chars > 1000:
+                markdown = format_book_for_obsidian(
+                    title="Автоматизация 101",
+                    description="Введение в автоматизацию — от основ до продвинутых практик",
+                    blocks=auto_blocks,
+                )
+                source_key = "lms:book:automation-101"
+                new_hash = hashlib.sha256(markdown.encode()).hexdigest()[:16]
+                old_hash = state.get_content_hash(source_key)
+
+                if old_hash != new_hash:
+                    path = f"{vault_path}/{kb_folder}/автоматизация 101.md"
+                    result = dbx.upload_file(markdown, path, overwrite=True)
+                    if result:
+                        state.update_lms(
+                            source_key=source_key,
+                            content_hash=new_hash,
+                            obsidian_path=f"{kb_folder}/автоматизация 101.md",
+                        )
+                        updated += 1
+                        details["automation-101"] = {
+                            "status": "updated",
+                            "blocks": len(auto_blocks),
+                            "chapters": sum(len(b.chapters) for b in auto_blocks),
+                            "chars": total_chars,
+                        }
+                        logger.info(
+                            f"Automation 101: updated ({total_chars:,} chars, "
+                            f"{sum(len(b.chapters) for b in auto_blocks)} chapters)"
+                        )
+                    else:
+                        errors += 1
+                        details["automation-101"] = {"error": "upload failed"}
+                else:
+                    details["automation-101"] = {"status": "unchanged"}
+            else:
+                logger.warning(f"Automation 101: insufficient content ({total_chars} chars)")
+                details["automation-101"] = {"status": "insufficient_content"}
+        else:
+            logger.info("Automation 101: no blocks found")
+            details["automation-101"] = {"status": "not_found"}
+    except Exception as e:
+        errors += 1
+        details["automation-101"] = {"error": str(e)}
+        logger.exception(f"Automation 101 sync error: {e}")
+
+    # ── Vibe-coding 101 ──────────────────────────────────────────
+    try:
+        vc_blocks = await fetch_vibe_coding_book(bundle_content)
+        if vc_blocks:
+            total_chars = sum(
+                len(ch.content) for b in vc_blocks for ch in b.chapters
+            )
+            if total_chars > 1000:
+                markdown = format_book_for_obsidian(
+                    title="Vibe-coding 101",
+                    description="Введение в vibe-coding — от идеи до прототипа",
+                    blocks=vc_blocks,
+                )
+                source_key = "lms:book:vibe-coding-101"
+                new_hash = hashlib.sha256(markdown.encode()).hexdigest()[:16]
+                old_hash = state.get_content_hash(source_key)
+
+                if old_hash != new_hash:
+                    path = f"{vault_path}/{kb_folder}/vibe-coding 101.md"
+                    result = dbx.upload_file(markdown, path, overwrite=True)
+                    if result:
+                        state.update_lms(
+                            source_key=source_key,
+                            content_hash=new_hash,
+                            obsidian_path=f"{kb_folder}/vibe-coding 101.md",
+                        )
+                        updated += 1
+                        details["vibe-coding-101"] = {
+                            "status": "updated",
+                            "chapters": sum(len(b.chapters) for b in vc_blocks),
+                            "chars": total_chars,
+                        }
+                        logger.info(
+                            f"Vibe-coding 101: updated ({total_chars:,} chars, "
+                            f"{sum(len(b.chapters) for b in vc_blocks)} chapters)"
+                        )
+                    else:
+                        errors += 1
+                        details["vibe-coding-101"] = {"error": "upload failed"}
+                else:
+                    details["vibe-coding-101"] = {"status": "unchanged"}
+            else:
+                logger.warning(f"Vibe-coding 101: insufficient content ({total_chars} chars)")
+                details["vibe-coding-101"] = {"status": "insufficient_content"}
+        else:
+            logger.info("Vibe-coding 101: no blocks found")
+            details["vibe-coding-101"] = {"status": "not_found"}
+    except Exception as e:
+        errors += 1
+        details["vibe-coding-101"] = {"error": str(e)}
+        logger.exception(f"Vibe-coding 101 sync error: {e}")
+
+    return {"updated": updated, "errors": errors, "details": details}
+
+
 async def _sync_lms_info(settings: Settings) -> dict:
     """Fetch labs and masterclasses for informational count only.
 
@@ -910,7 +1045,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Knowledge Capture Bot",
     description="Автоматический сбор материалов из Telegram и LMS в Obsidian",
-    version="1.6.1",
+    version="1.7.0",
     lifespan=lifespan,
 )
 

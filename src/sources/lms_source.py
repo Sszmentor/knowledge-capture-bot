@@ -31,6 +31,7 @@ SESSION_PATTERNS = [
     "oh01", "oh02", "oh03", "oh04",
     "fs01", "fs02", "fs03", "fs04",
     "fos18",
+    "demo-day",
     # POS sprint sessions
     "pos-intro", "pos-ws01", "pos-ws02", "pos-ws03", "pos-ws04",
     "pos-fs01", "pos-oh", "pos-bonus01", "pos-bonus02",

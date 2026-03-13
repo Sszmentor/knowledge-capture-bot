@@ -380,6 +380,8 @@ LMS_NAV_LABELS: dict[str, str] = {
     "pos-oh": "pos-oh",
     "pos-bonus01": "pos-bonus01",
     "pos-bonus02": "pos-bonus02",
+    # Special sessions
+    "demo-day": "demo day",
 }
 
 
@@ -555,44 +557,34 @@ created: {today}
 
 
 def _format_tools_page(items: list[dict], today: str, total: int) -> str:
-    """Format tools as a tiered reference table."""
-    # Group by tier
-    tiers: dict[str, list[dict]] = {}
-    tier_order = ["essential", "power", "pro"]
-    for item in items:
-        tier = item.get("tier", "other").lower()
-        tiers.setdefault(tier, []).append(item)
+    """Format tools as a reference table.
 
-    # Build ordered list of tiers present
-    ordered_tiers = [t for t in tier_order if t in tiers]
-    for t in tiers:
-        if t not in ordered_tiers:
-            ordered_tiers.append(t)
-
+    LMS tool structure: {id, label, type, path, metadata: {description, icon, url}}
+    """
     parts = [f"""---
 tags: [type/reference, project/ai-mindset, source/lms]
 created: {today}
 ---
 
-# Инструменты W26
+# Инструменты AI Mindset
 
 > {total} инструментов, упоминаемых в программе
 
-"""]
+| Инструмент | Описание | Ссылка |
+|---|---|---|"""]
 
-    for tier in ordered_tiers:
-        tier_items = tiers[tier]
-        tier_label = tier.capitalize()
-        parts.append(f"## {tier_label}\n")
-        parts.append("| Инструмент | Категория | Модель оплаты |")
-        parts.append("|---|---|---|")
-        for tool in tier_items:
-            name = tool.get("name", "")
-            category = tool.get("category", "")
-            pricing = tool.get("pricing", tool.get("price", ""))
-            parts.append(f"| {name} | {category} | {pricing} |")
-        parts.append("")
+    for tool in items:
+        name = tool.get("label", tool.get("name", ""))
+        meta = tool.get("metadata", {})
+        description = meta.get("description", tool.get("description", ""))
+        url = meta.get("url", tool.get("url", ""))
+        icon = meta.get("icon", "")
 
+        display_name = f"{icon} {name}" if icon else name
+        link = f"[{url}]({url})" if url else ""
+        parts.append(f"| {display_name} | {description} | {link} |")
+
+    parts.append("")
     return "\n".join(parts) + "\n"
 
 
