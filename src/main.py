@@ -1201,7 +1201,7 @@ async def force_resync_lms():
     all_state = state.get_all()
     cleared = 0
     for key in list(all_state.keys()):
-        if key.startswith("lms:") and not key.startswith("lms:sprint:") and not key.startswith("lms:kb:") and key not in ("lms:tools", "lms:prompts", "lms:metaphors", "lms:speakers"):
+        if key.startswith("lms:"):
             entry = all_state[key]
             if "content_hash" in entry:
                 entry["content_hash"] = ""
